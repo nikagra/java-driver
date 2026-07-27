@@ -19,6 +19,7 @@ package com.datastax.oss.driver.internal.core.loadbalancing;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -29,9 +30,12 @@ import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
 import com.datastax.oss.driver.api.core.config.DriverExecutionProfile;
 import com.datastax.oss.driver.api.core.loadbalancing.NodeDistance;
 import com.datastax.oss.driver.api.core.metadata.NodeState;
+import com.datastax.oss.driver.internal.core.metadata.DefaultEndPoint;
+import com.datastax.oss.driver.internal.core.metadata.DefaultNode;
 import com.datastax.oss.driver.shaded.guava.common.collect.ImmutableMap;
 import com.datastax.oss.driver.shaded.guava.common.collect.ImmutableSet;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import java.net.InetSocketAddress;
 import java.util.UUID;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -208,6 +212,39 @@ public class DefaultLoadBalancingPolicyInitTest extends LoadBalancingPolicyTestB
                 .anyMatch(
                     e -> e.getFormattedMessage().contains("does not match any node's datacenter")))
         .isTrue();
+  }
+
+  @Test
+  public void should_not_warn_about_dc_mismatch_when_the_only_real_node_matches_configured_dc() {
+    // Given — CUSTOMER-588: a contact point provided as a hostname is represented, before the
+    // control connection resolves it, by an ephemeral placeholder Node (created by
+    // MetadataManager#addContactPoints via DefaultNode#newContactPoint) whose datacenter is
+    // always null — it is never populated, since real topology info is attached to a *different*
+    // Node object matched by hostId (see MetadataManager#registerNode). Here, the only node with
+    // real, resolved metadata (node1) genuinely IS in the configured local DC ("dc1", per base
+    // setup), so no DC-mismatch warning should be logged.
+    DefaultNode ephemeralContactPointNode =
+        DefaultNode.newContactPoint(
+            new DefaultEndPoint(new InetSocketAddress("127.0.0.9", 9042)), context);
+    when(metadataManager.getContactPoints()).thenReturn(ImmutableSet.of(ephemeralContactPointNode));
+    DefaultLoadBalancingPolicy policy = createPolicy();
+
+    // When
+    policy.init(ImmutableMap.of(UUID.randomUUID(), node1), distanceReporter);
+
+    // Then — no warning should claim contact points are from a different DC: the actual cluster
+    // (node1) matches the configured DC exactly. Fails today because
+    // OptionalLocalDcHelper#checkLocalDatacenterCompatibility checks the ephemeral contact-point
+    // node (always null datacenter) instead of the resolved node map.
+    verify(appender, atLeast(0)).doAppend(loggingEventCaptor.capture());
+    assertThat(
+            loggingEventCaptor.getAllValues().stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .anyMatch(
+                    e ->
+                        e.getFormattedMessage()
+                            .contains("some contact points are from a different DC")))
+        .isFalse();
   }
 
   @NonNull
