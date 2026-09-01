@@ -99,11 +99,18 @@ download-all-dependencies: compile-all .download-test-dependencies .download-ver
 CASSANDRA_VERSION_FILE=/tmp/cassandra-version-${CASSANDRA_VERSION}.resolved
 resolve-cassandra-version: .prepare-get-version
 	@find "${CASSANDRA_VERSION_FILE}" -mtime +0 -delete 2>/dev/null 1>&1
+	# The cache is shared and outlives a Makefile change, so an entry written before
+	# the check below existed can still hold a partial version. Drop it and resolve
+	# again rather than serve it and bypass the check.
+	if [[ -f "${CASSANDRA_VERSION_FILE}" ]] && [[ "$$(cat ${CASSANDRA_VERSION_FILE})" =~ ^[0-9]+\.[0-9]+$$ ]]; then
+		rm -f "${CASSANDRA_VERSION_FILE}"
+	fi
 	if [[ -f "${CASSANDRA_VERSION_FILE}" ]]; then
 		echo "Resolved Cassandra ${CASSANDRA_VERSION} to $$(cat ${CASSANDRA_VERSION_FILE})"
 		exit 0
 	fi
 
+	CASSANDRA_VERSION_EXACT=
 	if [[ "${CASSANDRA_VERSION}" == "4-LATEST" ]]; then
 		CASSANDRA_VERSION_RESOLVED=$$(get-version -source github-tag -repo apache/cassandra -prefix "cassandra-" -out-no-prefix -filters "^[0-9]+$$.^[0-9]+$$.^[0-9]+$$ and 4.LAST.LAST" | tr -d '\"')
 	elif [[ "${CASSANDRA_VERSION}" == "3-LATEST" ]]; then
@@ -114,13 +121,16 @@ resolve-cassandra-version: .prepare-get-version
 		# Complete a two-component version to its newest patch. See the comment in
 		# resolve-scylla-version for why a partial version must not reach CCM.
 		CASSANDRA_VERSION_RESOLVED=$$(get-version -source github-tag -repo apache/cassandra -prefix "cassandra-" -out-no-prefix -filters "^[0-9]+$$.^[0-9]+$$.^[0-9]+$$ and ${CASSANDRA_VERSION}.LAST" | tr -d '\"')
-	elif echo "${CASSANDRA_VERSION}" | grep -qP '^[0-9]+\.[0-9]+'; then
+	elif [[ "${CASSANDRA_VERSION}" =~ ^[0-9]+\.[0-9]+[-~.][A-Za-z0-9][A-Za-z0-9._~-]*$$ ]]; then
 		# Pre-release and other suffixed forms (4.0-alpha1, 5.0-beta1) already name one
-		# exact build, so pass them through and skip the check below.
+		# exact build, so pass them through and skip the check below. The pattern is
+		# anchored: matching on a numeric prefix alone would also exempt a typo such as
+		# '4.1.' or '4.1x' from the check, which is the one thing it has to catch.
 		CASSANDRA_VERSION_RESOLVED=${CASSANDRA_VERSION}
 		CASSANDRA_VERSION_EXACT=1
 	else
 		echo "Unknown Cassandra version name '${CASSANDRA_VERSION}'"
+		echo "Expected 3-LATEST, 4-LATEST, MAJOR.MINOR.PATCH, MAJOR.MINOR, or a suffixed build such as 4.0-alpha1"
 		exit 1
 	fi
 
@@ -143,11 +153,18 @@ resolve-cassandra-version: .prepare-get-version
 SCYLLA_VERSION_FILE=/tmp/scylla-version-${SCYLLA_VERSION}.resolved
 resolve-scylla-version: .prepare-get-version
 	@find "${SCYLLA_VERSION_FILE}" -mtime +0 -delete 2>/dev/null 1>&1
+	# The cache is shared and outlives a Makefile change, so an entry written before
+	# the check below existed can still hold a partial version. Drop it and resolve
+	# again rather than serve it and bypass the check.
+	if [[ -f "${SCYLLA_VERSION_FILE}" ]] && [[ "$$(cat ${SCYLLA_VERSION_FILE})" =~ ^[0-9]+\.[0-9]+$$ ]]; then
+		rm -f "${SCYLLA_VERSION_FILE}"
+	fi
 	if [[ -f "${SCYLLA_VERSION_FILE}" ]]; then
 		echo "Resolved ScyllaDB ${SCYLLA_VERSION} to $$(cat ${SCYLLA_VERSION_FILE})"
 		exit 0
 	fi
 
+	SCYLLA_VERSION_EXACT=
 	if [[ "${SCYLLA_VERSION}" == "LTS-LATEST" ]]; then
 		SCYLLA_VERSION_RESOLVED=$$(get-version --source dockerhub-imagetag --repo scylladb/scylla -filters "^[0-9]{4}$$.^[0-9]+$$.^[0-9]+$$ and LAST.1.LAST" | tr -d '\"')
 	elif [[ "${SCYLLA_VERSION}" == "LTS-PRIOR" ]]; then
@@ -164,20 +181,25 @@ resolve-scylla-version: .prepare-get-version
 	elif [[ "${SCYLLA_VERSION}" =~ ^[0-9]+\.[0-9]+$$ ]]; then
 		# A two-component version such as 2026.2 is accepted by CCM, but CCM then stores
 		# the downloaded release under its full version while looking it up under the
-		# partial one, so the lookup never hits the cache: every single 'ccm create'
-		# re-queries S3 for the newest patch and the integration tests take several
-		# times longer. Resolve it here, once, so the tests get a cache hit instead.
+		# partial one, so the lookup never hits its own entry: every single 'ccm create'
+		# re-queries S3 for the newest patch. Resolve it here, once, so that the cache
+		# entry CCM writes is the one it later looks up.
 		SCYLLA_VERSION_RESOLVED=$$(get-version --source dockerhub-imagetag --repo scylladb/scylla -filters "^[0-9]+$$.^[0-9]+$$.^[0-9]+$$ and ${SCYLLA_VERSION}.LAST" | tr -d '\"')
-		if [[ -z "$${SCYLLA_VERSION_RESOLVED}" ]]; then
+		# Releases before 2025.1 are in the scylla-enterprise repo, and only ever under a
+		# four-digit year, so an OSS line (6.2, 5.4) must not pay for a second lookup.
+		if [[ -z "$${SCYLLA_VERSION_RESOLVED}" ]] && [[ "${SCYLLA_VERSION}" =~ ^[0-9]{4}\. ]]; then
 			SCYLLA_VERSION_RESOLVED=$$(get-version --source dockerhub-imagetag --repo scylladb/scylla-enterprise -filters "^[0-9]+$$.^[0-9]+$$.^[0-9]+$$ and ${SCYLLA_VERSION}.LAST" | tr -d '\"')
 		fi
-	elif echo "${SCYLLA_VERSION}" | grep -qP '^[0-9]+\.[0-9]+'; then
+	elif [[ "${SCYLLA_VERSION}" =~ ^[0-9]+\.[0-9]+[-~.][A-Za-z0-9][A-Za-z0-9._~-]*$$ ]]; then
 		# Pre-release and other suffixed forms (2022.2.0-rc0, 5.0.rc3) already name one
-		# exact build, so pass them through and skip the check below.
+		# exact build, so pass them through and skip the check below. The pattern is
+		# anchored: matching on a numeric prefix alone would also exempt a typo such as
+		# '5.4.' or '2026.2x' from the check, which is the one thing it has to catch.
 		SCYLLA_VERSION_RESOLVED=${SCYLLA_VERSION}
 		SCYLLA_VERSION_EXACT=1
 	else
 		echo "Unknown ScyllaDB version name '${SCYLLA_VERSION}'"
+		echo "Expected LATEST, PRIOR, LTS-LATEST, LTS-PRIOR, MAJOR.MINOR.PATCH, MAJOR.MINOR, or a suffixed build such as 2022.2.0-rc0"
 		exit 1
 	fi
 
@@ -188,8 +210,8 @@ resolve-scylla-version: .prepare-get-version
 
 	if [[ -z "$${SCYLLA_VERSION_EXACT}" ]] && [[ ! "$${SCYLLA_VERSION_RESOLVED}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$$ ]]; then
 		echo "Resolved ScyllaDB version '$${SCYLLA_VERSION_RESOLVED}' is not fully qualified, expected MAJOR.MINOR.PATCH"
-		echo "A partial version makes every 'ccm create' query S3 for the newest patch,"
-		echo "which makes the integration tests several times slower."
+		echo "A partial version makes every 'ccm create' re-query S3 for the newest patch"
+		echo "instead of reusing the installed release, which slows the tests down."
 		exit 1
 	fi
 
