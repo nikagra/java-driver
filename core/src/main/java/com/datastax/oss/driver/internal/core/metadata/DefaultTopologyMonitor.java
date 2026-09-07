@@ -351,7 +351,7 @@ public class DefaultTopologyMonitor implements TopologyMonitor {
     if (closeFuture.isDone()) {
       return CompletableFutures.failedFuture(new IllegalStateException("closed"));
     }
-    EndPoint localEndPoint = connectedNodeEndPoint(channel);
+    EndPoint localEndPoint = channel.getEndPoint();
     return query(channel, buildQuery(localColumns, "system.local", "key='local'"))
         .thenApply(
             result -> {
@@ -626,8 +626,10 @@ public class DefaultTopologyMonitor implements TopologyMonitor {
   }
 
   /**
-   * The endpoint to register the node at the other end of {@code channel} under, when the node is
-   * identified for the first time.
+   * The endpoint to identify the node at the other end of {@code channel} by, applied to the
+   * channel by {@code ControlConnection} when it adopts it, before any query is sent, and only for
+   * a candidate with no host id -- so the unresolved endpoint this looks for is a contact point's,
+   * never a node endpoint the driver derived for itself.
    *
    * <p>A contact point's endpoint is an unresolved name by default, and that name is not the
    * node's: every node ever reached through the contact point would be registered under it, and
@@ -640,11 +642,14 @@ public class DefaultTopologyMonitor implements TopologyMonitor {
    *
    * <p>Anything else is returned as configured: a resolved endpoint ({@code resolve-contact-points
    * = true}, or a programmatic resolved address), a third-party {@link EndPoint}, or a channel
-   * whose remote address is not an {@link InetSocketAddress}. For the default deployment this moves
-   * the control node's metric name from the contact point's name to its own address, once, and pool
-   * connections opened to it later verify TLS against that address, like every peer's.
+   * whose remote address is not an {@link InetSocketAddress}. Those already name a node, so there
+   * is nothing to derive -- a resolved contact point keeps identifying the control node by the name
+   * it was configured with, deliberately. For the default deployment this moves the control node's
+   * metric name from the contact point's name to its own address, once, and pool connections opened
+   * to it later verify TLS against that address, like every peer's.
    */
-  private static EndPoint connectedNodeEndPoint(DriverChannel channel) {
+  @Override
+  public EndPoint connectedNodeEndPoint(DriverChannel channel) {
     EndPoint configured = channel.getEndPoint();
     if (!(configured instanceof DefaultEndPoint)
         || !((DefaultEndPoint) configured).resolve().isUnresolved()) {

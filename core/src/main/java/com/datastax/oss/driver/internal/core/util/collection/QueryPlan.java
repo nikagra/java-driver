@@ -39,8 +39,10 @@ import net.jcip.annotations.ThreadSafe;
  * methods throw.
  *
  * <p>Both {@link #size()} and {@link #iterator()} are supported and never throw, even if called
- * concurrently. These methods are implemented for reporting purposes only, the driver itself does
- * not use them.
+ * concurrently. They exist mainly for reporting, and the request path does not use them; the one
+ * driver caller is {@code LoadBalancingPolicyWrapper#newControlReconnectionQueryPlan}, which asks
+ * {@code isEmpty()} (that is, {@code size() == 0}) of the plan a policy returned, so a custom
+ * implementation that throws from {@code size()} breaks control-connection reconnection.
  *
  * <p>All built-in {@link QueryPlan} implementations can be safely reused for custom load balancing
  * policies; if you plan to do so, study the source code of {@link

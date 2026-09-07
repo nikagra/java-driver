@@ -28,6 +28,8 @@ import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
 import com.datastax.oss.driver.api.core.config.DriverConfig;
 import com.datastax.oss.driver.api.core.config.DriverExecutionProfile;
 import com.datastax.oss.driver.api.core.metadata.EndPoint;
+import com.datastax.oss.driver.api.core.metadata.Metadata;
+import com.datastax.oss.driver.api.core.metadata.Node;
 import com.datastax.oss.driver.internal.core.adminrequest.AdminResult;
 import com.datastax.oss.driver.internal.core.adminrequest.AdminRow;
 import com.datastax.oss.driver.internal.core.channel.DriverChannel;
@@ -66,6 +68,8 @@ public class ClientRoutesTopologyMonitorTest {
   @Mock private ControlConnection controlConnection;
   @Mock private DriverConfig driverConfig;
   @Mock private DriverExecutionProfile defaultProfile;
+  @Mock private MetadataManager metadataManager;
+  @Mock private Metadata metadata;
 
   private TestableClientRoutesTopologyMonitor handler;
 
@@ -218,6 +222,113 @@ public class ClientRoutesTopologyMonitorTest {
 
     assertThat(handler.resolve(hostId1)).isNull();
     assertThat(handler.resolve(hostId2)).isNotNull();
+  }
+
+  // ---- reresolvesNodeAddresses() -------------------------------------------
+
+  @Test
+  public void should_reresolve_when_all_known_nodes_have_client_routes() {
+    UUID hostId1 = UUID.randomUUID();
+    UUID hostId2 = UUID.randomUUID();
+    // Unstubbed on purpose: getNodes() is keyed by host id, and that key is what the coverage
+    // check reads. Stubbing getHostId() here would suggest the node is asked, and it is not.
+    Node node1 = Mockito.mock(Node.class);
+    Node node2 = Mockito.mock(Node.class);
+    when(context.getMetadataManager()).thenReturn(metadataManager);
+    when(metadataManager.getMetadata()).thenReturn(metadata);
+    when(metadata.getNodes()).thenReturn(ImmutableMap.of(hostId1, node1, hostId2, node2));
+    // Name-valued routes: these are the only ones that reach DNS again on a later connect.
+    handler.setRoutes(
+        ImmutableMap.of(
+            hostId1, new ClientRouteRecord(hostId1, "node1.route.example.com", 9042),
+            hostId2, new ClientRouteRecord(hostId2, "node2.route.example.com", 9042)));
+
+    assertThat(handler.reresolvesNodeAddresses()).isTrue();
+  }
+
+  @Test
+  public void should_not_reresolve_when_a_known_node_has_no_client_route() {
+    UUID hostId1 = UUID.randomUUID();
+    UUID hostId2 = UUID.randomUUID();
+    Node node1 = Mockito.mock(Node.class);
+    Node node2 = Mockito.mock(Node.class);
+    when(context.getMetadataManager()).thenReturn(metadataManager);
+    when(metadataManager.getMetadata()).thenReturn(metadata);
+    when(metadata.getNodes()).thenReturn(ImmutableMap.of(hostId1, node1, hostId2, node2));
+    // Only node1 has a live client route; node2 would fall back to a static endpoint. node1's
+    // route has to be name-valued, or this passes on the literal check instead and stops pinning
+    // the missing-route case at all -- that case has its own test below.
+    handler.setRoutes(
+        ImmutableMap.of(hostId1, new ClientRouteRecord(hostId1, "node1.route.example.com", 9042)));
+
+    assertThat(handler.reresolvesNodeAddresses()).isFalse();
+  }
+
+  @Test
+  public void should_not_reresolve_when_no_nodes_are_known_yet() {
+    // "Every known node has a route" is vacuously true of an empty set, and answering yes there
+    // would suppress the contact-point reconnection fallback at the one moment it is the only way
+    // back: before the first node refresh, or after this monitor has removed every node.
+    when(context.getMetadataManager()).thenReturn(metadataManager);
+    when(metadataManager.getMetadata()).thenReturn(metadata);
+    when(metadata.getNodes()).thenReturn(Collections.emptyMap());
+
+    assertThat(handler.reresolvesNodeAddresses()).isFalse();
+  }
+
+  @Test
+  public void should_not_reresolve_once_closed() throws Exception {
+    // resolve() throws IllegalStateException once the monitor is closed, so a closed monitor
+    // re-resolves nothing, however complete its route cache still looks; answering from the cache
+    // alone would suppress the contact-point fallback for a reconnection racing session shutdown.
+    UUID hostId = UUID.randomUUID();
+    Node node = Mockito.mock(Node.class);
+    when(context.getMetadataManager()).thenReturn(metadataManager);
+    when(metadataManager.getMetadata()).thenReturn(metadata);
+    when(metadata.getNodes()).thenReturn(ImmutableMap.of(hostId, node));
+    handler.setRoutes(
+        ImmutableMap.of(hostId, new ClientRouteRecord(hostId, "node.route.example.com", 9042)));
+    // Every known node has a name-valued route, so this would otherwise report true.
+    assertThat(handler.reresolvesNodeAddresses()).isTrue();
+
+    handler.closeAsync().toCompletableFuture().get(5, TimeUnit.SECONDS);
+
+    assertThat(handler.reresolvesNodeAddresses()).isFalse();
+  }
+
+  @Test
+  public void should_not_reresolve_when_a_route_address_is_an_ip_literal() {
+    // A literal route resolves to the same address forever (resolve() just hands it back), so it
+    // re-resolves nothing. Reporting true would suppress the contact-point fallback, which is the
+    // only path by which such a node could ever learn a new address.
+    UUID hostId1 = UUID.randomUUID();
+    UUID hostId2 = UUID.randomUUID();
+    Node node1 = Mockito.mock(Node.class);
+    Node node2 = Mockito.mock(Node.class);
+    when(context.getMetadataManager()).thenReturn(metadataManager);
+    when(metadataManager.getMetadata()).thenReturn(metadata);
+    when(metadata.getNodes()).thenReturn(ImmutableMap.of(hostId1, node1, hostId2, node2));
+    handler.setRoutes(
+        ImmutableMap.of(
+            hostId1, new ClientRouteRecord(hostId1, "node1.route.example.com", 9042),
+            hostId2, new ClientRouteRecord(hostId2, "127.0.0.2", 9042)));
+
+    assertThat(handler.reresolvesNodeAddresses()).isFalse();
+  }
+
+  @Test
+  public void should_not_reresolve_when_a_route_address_is_a_bracketed_ipv6_literal() {
+    // InetAddress.getByName() accepts the bracketed form, so it has to be recognised as a literal
+    // here too; otherwise it reads as a name and claims a re-resolution that cannot happen.
+    UUID hostId = UUID.randomUUID();
+    Node node = Mockito.mock(Node.class);
+    when(context.getMetadataManager()).thenReturn(metadataManager);
+    when(metadataManager.getMetadata()).thenReturn(metadata);
+    when(metadata.getNodes()).thenReturn(ImmutableMap.of(hostId, node));
+    handler.setRoutes(
+        ImmutableMap.of(hostId, new ClientRouteRecord(hostId, "[2001:db8::1]", 9042)));
+
+    assertThat(handler.reresolvesNodeAddresses()).isFalse();
   }
 
   // ---- Merge behavior tests -----------------------------------------------

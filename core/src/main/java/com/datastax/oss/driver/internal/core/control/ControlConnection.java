@@ -61,7 +61,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.Objects;
 import java.util.Queue;
 import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
@@ -459,6 +458,51 @@ public class ControlConnection implements EventCallback, AsyncAutoCloseable {
                       connect(nodes, errors, onSuccess, onFailure);
                     } else {
                       LOG.debug("[{}] New channel opened {}", logPrefix, channel);
+                      // A candidate with no host id is a contact point we have never identified:
+                      // it was dialled at an address that names no node in particular, so ask the
+                      // monitor who answered. A candidate that has one is already identified, and
+                      // its endpoint is the driver's own choice -- an address translator's
+                      // unresolved hostname, say, which is re-resolved on every connection and
+                      // must not be frozen to the one address this connection happened to reach.
+                      // Same test as resolveChannelNodeIfNeeded() below, and the same reason.
+                      //
+                      // Whichever branch this takes, the identity has to be on the channel before
+                      // the channel becomes visible to anything else. Every read of
+                      // channel.getEndPoint() from here on -- the topology monitor's three
+                      // node-refresh methods included -- must see the same endpoint: if one
+                      // refresh identified the control node by the address it was dialled at and
+                      // the next by the address it answered on, the second would compare the two
+                      // (a blocking lookup, for a mixed resolved/unresolved pair) and then rewrite
+                      // the node's endpoint and clear its metrics.
+                      if (node.getHostId() == null) {
+                        EndPoint identity;
+                        try {
+                          identity = context.getTopologyMonitor().connectedNodeEndPoint(channel);
+                        } catch (RuntimeException monitorError) {
+                          // The monitor is pluggable, and this is the first thing done with a
+                          // freshly opened channel: the catch-all at the end of this callback would
+                          // only log, leaving the channel open with nothing referencing it -- and
+                          // the round neither succeeded nor failed, so a Reconnection would wait on
+                          // it forever. Drop the candidate instead, the way every other branch here
+                          // does.
+                          Loggers.warnWithException(
+                              LOG,
+                              "[{}] Error identifying the node behind {}, trying next node",
+                              logPrefix,
+                              node,
+                              monitorError);
+                          channel.forceClose();
+                          List<Entry<Node, Throwable>> newErrors =
+                              (errors == null) ? new ArrayList<>() : errors;
+                          newErrors.add(new SimpleEntry<>(node, monitorError));
+                          connect(nodes, newErrors, onSuccess, onFailure);
+                          return;
+                        }
+                        if (identity != null && identity != channel.getEndPoint()) {
+                          channel.setEndPoint(identity);
+                          LOG.debug("[{}] Control channel identified as {}", logPrefix, identity);
+                        }
+                      }
                       DriverChannel previousChannel = ControlConnection.this.channel;
                       ControlConnection.this.channel = channel;
                       controlNodeState = new ControlNodeState(null, node);
@@ -499,6 +543,42 @@ public class ControlConnection implements EventCallback, AsyncAutoCloseable {
                                           node,
                                           new Exception("Channel closed during endpoint resolve")));
                                   connect(nodes, newErrors, onSuccess, onFailure);
+                                } else if (isUnusableForControl(resolvedNode)) {
+                                  // A contact point's identity is only known once the resolve
+                                  // above completes, and events name the metadata node rather than
+                                  // the placeholder we dialled, so isControlNode() cannot match the
+                                  // two -- and comparing their endpoints there would mean the
+                                  // blocking lookup this path exists to avoid. So re-run the
+                                  // pre-connect check against the node we actually identified.
+                                  // lastNodeDistance/lastNodeState are cumulative, so this also
+                                  // catches an event that arrived before the channel opened, which
+                                  // the check on the placeholder never saw.
+                                  controlNodeState = ControlNodeState.NONE;
+                                  LOG.debug(
+                                      "[{}] New channel opened ({}) but {} is ignored, removed "
+                                          + "or forced down, closing and trying next node",
+                                      logPrefix,
+                                      channel,
+                                      resolvedNode);
+                                  // Null out before forceClose() so that onChannelClosed() does not
+                                  // start a redundant reconnection on top of the connect() retry
+                                  // below.
+                                  ControlConnection.this.channel = null;
+                                  channel.forceClose();
+                                  // Recorded like every other reason a candidate was dropped: a
+                                  // round in which all of them are dropped here would otherwise
+                                  // fail with a causeless NoNodeAvailableException, saying nothing
+                                  // about the channels that were opened and deliberately closed.
+                                  List<Entry<Node, Throwable>> newErrors =
+                                      (errors == null) ? new ArrayList<>() : errors;
+                                  newErrors.add(
+                                      new SimpleEntry<>(
+                                          node,
+                                          new Exception(
+                                              "Control node "
+                                                  + resolvedNode
+                                                  + " is ignored, removed or forced down")));
+                                  connect(nodes, newErrors, onSuccess, onFailure);
                                 } else {
                                   controlNodeState = new ControlNodeState(resolvedNode, null);
                                   context
@@ -533,32 +613,42 @@ public class ControlConnection implements EventCallback, AsyncAutoCloseable {
      * Resolves the identity of the node at the other end of the channel. For contact point nodes
      * (no hostId), queries system.local and registers a new metadata node. For nodes that already
      * have a hostId, returns the node as-is.
+     *
+     * <p>Never throws: the monitor is pluggable, and a throw from it would reach the catch-all in
+     * {@link #connect}, which only logs -- so the round would neither succeed nor fail and a {@link
+     * Reconnection} would wait on it forever. Reported as a failed stage instead, which the caller
+     * already treats as one more reason to close this channel and try the next node.
      */
     private CompletionStage<Node> resolveChannelNodeIfNeeded(
         DriverChannel channel, DefaultNode node) {
       if (node.getHostId() != null) {
         return CompletableFuture.completedFuture(node);
       }
-      return context
-          .getTopologyMonitor()
-          .getChannelNodeInfo(channel)
-          .thenComposeAsync(
-              nodeInfo -> {
-                EndPoint resolvedEp = nodeInfo.getEndPoint();
-                // Compared by reference, not equals(): DefaultEndPoint.equals resolves the
-                // unresolved side of a mixed comparison, a blocking lookup on this admin executor,
-                // and it would answer "equal" for the very case this exists for (a hostname contact
-                // point identified by the address it reached), skipping the adoption. Adopting the
-                // monitor's instance also makes the channel and the metadata node share it, so
-                // every
-                // later comparison of the two short-circuits on identity.
-                if (resolvedEp != null && resolvedEp != channel.getEndPoint()) {
-                  channel.setEndPoint(resolvedEp);
-                  LOG.debug("[{}] Control channel endpoint upgraded to {}", logPrefix, resolvedEp);
-                }
-                return context.getMetadataManager().registerNode(nodeInfo);
-              },
-              adminExecutor);
+      try {
+        return context
+            .getTopologyMonitor()
+            .getChannelNodeInfo(channel)
+            .thenComposeAsync(
+                nodeInfo -> {
+                  EndPoint resolvedEp = nodeInfo.getEndPoint();
+                  // A monitor that builds its endpoints from the identity row rather than from the
+                  // socket (the Cloud SNI proxy, client routes) only knows the node's endpoint now;
+                  // connectedNodeEndPoint() left the channel's alone for those. Compared by
+                  // reference, not equals(): DefaultEndPoint.equals resolves the unresolved side of
+                  // a mixed comparison, a blocking lookup on this admin executor. Adopting the
+                  // monitor's instance also makes the channel and the metadata node share it, so
+                  // every later comparison of the two short-circuits on identity.
+                  if (resolvedEp != null && resolvedEp != channel.getEndPoint()) {
+                    channel.setEndPoint(resolvedEp);
+                    LOG.debug(
+                        "[{}] Control channel endpoint upgraded to {}", logPrefix, resolvedEp);
+                  }
+                  return context.getMetadataManager().registerNode(nodeInfo);
+                },
+                adminExecutor);
+      } catch (RuntimeException monitorError) {
+        return CompletableFutures.failedFuture(monitorError);
+      }
     }
 
     private void onSuccessfulReconnect() {
@@ -694,12 +784,47 @@ public class ControlConnection implements EventCallback, AsyncAutoCloseable {
           && eventNode.getHostId().equals(state.current.getHostId())) {
         return true;
       }
-      if (state.current == null
-          && state.pending != null
-          && Objects.equals(eventNode.getEndPoint(), state.pending.getEndPoint())) {
-        return true;
-      }
-      return false;
+      // Reference identity, not endpoint equality: the reconnection plan now appends the
+      // unresolved contact-point nodes (fallback-to-original-contact-points defaults to true), so a
+      // mixed resolved/unresolved pair is routine here, and DefaultEndPoint.equals resolves the
+      // unresolved side of one -- a blocking lookup on this admin executor, during the very DNS
+      // outage the fallback exists for. Nodes carry identity semantics (no equals override, and
+      // lastNodeState/lastNodeDistance already key on the instance) and connect() stores the plan's
+      // own node as pending, so an event about that node carries the same object.
+      //
+      // An event naming the metadata node for the host we are still identifying cannot be matched
+      // here at all -- pending is the placeholder, and the two are different instances by
+      // construction (MetadataManager.registerNode never reuses a contact-point node). Endpoint
+      // equality appeared to cover that case, but only by paying the blocking lookup above.
+      // connect() instead re-checks the identified node with isUnusableForControl() once the
+      // resolve completes, which closes the window without any DNS.
+      return state.current == null && state.pending != null && eventNode == state.pending;
+    }
+
+    /**
+     * Whether an event has already marked this node unusable for the control connection: the load
+     * balancing policy ignored it, or it was removed or forced down.
+     *
+     * <p>Mirrors the two checks {@link #connect} runs before it adopts a freshly opened channel.
+     * Those stay separate rather than calling this: they answer from records read before the
+     * channel was opened, this one from the records as they stand now, and each keeps its own
+     * diagnostic message.
+     *
+     * <p>Answers only for a node some event has named. Both records are keyed by node instance (and
+     * weakly), so this sees a node the driver already knows -- either a query-plan node, or a host
+     * id {@code MetadataManager#registerNode} found in the metadata and handed back. It cannot see
+     * a node registered fresh from a contact point: {@code registerNode} mints a new instance for
+     * an unknown host id and re-inserts it into the metadata before this runs, so a host the driver
+     * had removed is resurrected rather than rejected. Detecting that needs a removal record keyed
+     * by host id, with a defined lifetime, which this check deliberately does not attempt:
+     * rejecting every host id absent from the metadata would also reject the genuinely new nodes of
+     * a cluster that moved, which is the case the fallback exists to recover.
+     */
+    private boolean isUnusableForControl(Node node) {
+      NodeState state = lastNodeState.get(node);
+      return lastNodeDistance.get(node) == NodeDistance.IGNORED
+          || (lastNodeState.containsKey(node)
+              && (state == null /*(removed)*/ || state == NodeState.FORCED_DOWN));
     }
 
     private void onDistanceEvent(DistanceEvent event) {

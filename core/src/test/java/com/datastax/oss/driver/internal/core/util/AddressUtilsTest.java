@@ -37,47 +37,17 @@ public class AddressUtilsTest {
   };
 
   @Test
-  public void should_label_ipv4_address() throws Exception {
-    InetAddress labelled =
-        AddressUtils.withHostName("cluster.example.com", InetAddress.getByAddress(IPV4));
-
-    assertThat(labelled.getHostName()).isEqualTo("cluster.example.com");
-    assertThat(labelled.getHostAddress()).isEqualTo("10.0.0.2");
-  }
-
-  @Test
-  public void should_remove_label_from_ipv4_address() throws Exception {
-    InetAddress labelled = InetAddress.getByAddress("cluster.example.com", IPV4);
-
-    InetAddress unlabelled = AddressUtils.withHostName(null, labelled);
-
-    assertThat(unlabelled.getHostAddress()).isEqualTo("10.0.0.2");
-    // InetAddress#toString() prints the label field as-is, without resolving it.
-    assertThat(unlabelled.toString()).isEqualTo("/10.0.0.2");
-  }
-
-  @Test
-  public void should_not_append_scope_to_unscoped_ipv6_address() throws Exception {
-    Inet6Address unscoped = (Inet6Address) InetAddress.getByAddress(null, IPV6);
+  public void should_strip_host_name_from_unscoped_ipv6_address() throws Exception {
+    Inet6Address unscoped = (Inet6Address) InetAddress.getByAddress("cluster.example.com", IPV6);
     assertThat(unscoped.getScopeId()).isZero();
 
-    InetAddress relabelled = AddressUtils.withHostName("cluster.example.com", unscoped);
+    InetSocketAddress stripped = AddressUtils.stripHostName(new InetSocketAddress(unscoped, 9042));
 
     // The whole point of the scopeId != 0 guard: the scoped getByAddress() overload treats any
     // scope_id >= 0 as scoped, so going through it here would report 2001:db8::1%0.
-    assertThat(relabelled.getHostAddress()).isEqualTo("2001:db8:0:0:0:0:0:1");
-    assertThat(relabelled.getHostAddress()).doesNotContain("%");
-    assertThat(((Inet6Address) relabelled).getScopeId()).isZero();
-  }
-
-  @Test
-  public void should_preserve_ipv6_scope_id() throws Exception {
-    Inet6Address scoped = Inet6Address.getByAddress("cluster.example.com", IPV6, 5);
-
-    InetAddress unlabelled = AddressUtils.withHostName(null, scoped);
-
-    assertThat(((Inet6Address) unlabelled).getScopeId()).isEqualTo(5);
-    assertThat(unlabelled.getHostAddress()).isEqualTo("2001:db8:0:0:0:0:0:1%5");
+    assertThat(stripped).isNotNull();
+    assertThat(stripped.getHostString()).isEqualTo("2001:db8:0:0:0:0:0:1");
+    assertThat(stripped.getHostString()).doesNotContain("%");
   }
 
   @Test
@@ -113,5 +83,38 @@ public class AddressUtilsTest {
 
     // No InetAddress to strip, so there is no identity to derive: callers keep what they had.
     assertThat(AddressUtils.stripHostName(unresolved)).isNull();
+  }
+
+  @Test
+  public void should_recognise_ip_literals() {
+    assertThat(AddressUtils.isIpLiteral("10.0.0.2")).isTrue();
+    assertThat(AddressUtils.isIpLiteral("2001:db8::1")).isTrue();
+    // getByName() accepts the bracketed form; Guava's isInetAddress does not.
+    assertThat(AddressUtils.isIpLiteral("[2001:db8::1]")).isTrue();
+    // Shorthand dotted-decimal: getByName() parses these numerically (127.1 is 127.0.0.1,
+    // 10.1.2 is 10.1.0.2, and a bare integer is the whole 32 bits), so they resolve to the same
+    // address forever. Guava requires all four parts and calls each of them a name.
+    assertThat(AddressUtils.isIpLiteral("127.1")).isTrue();
+    assertThat(AddressUtils.isIpLiteral("10.1.2")).isTrue();
+    assertThat(AddressUtils.isIpLiteral("2130706433")).isTrue();
+    // Five parts is more than getByName() can parse, so it goes to the resolver instead of being
+    // rejected -- the one place the widened rule is generous rather than exact. Pinned because it
+    // is the safe direction: a name mistaken for a literal only keeps the contact-point fallback.
+    assertThat(AddressUtils.isIpLiteral("1.2.3.4.5")).isTrue();
+    // Scope ids: accepted by the Guava this build shades, and by getByName() for a numeric zone.
+    // Older Guava rejected the % suffix, and a literal read as a name suppresses the one fallback
+    // a fixed address has, so pin the forms rather than trust the dependency.
+    assertThat(AddressUtils.isIpLiteral("fe80::1%3")).isTrue();
+    assertThat(AddressUtils.isIpLiteral("fe80::1%eth0")).isTrue();
+    assertThat(AddressUtils.isIpLiteral("[fe80::1%3]")).isTrue();
+  }
+
+  @Test
+  public void should_recognise_host_names() {
+    assertThat(AddressUtils.isIpLiteral("cluster.example.com")).isFalse();
+    assertThat(AddressUtils.isIpLiteral("nlb1.example.com")).isFalse();
+    // Digits and dots is the widened rule, so a name has to contain something else -- which every
+    // name does, since a top-level domain cannot be all-numeric.
+    assertThat(AddressUtils.isIpLiteral("10.0.0.2.example.com")).isFalse();
   }
 }

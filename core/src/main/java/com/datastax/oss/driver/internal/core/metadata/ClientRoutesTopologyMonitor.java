@@ -21,12 +21,14 @@ import com.datastax.oss.driver.api.core.config.ClientRouteProxy;
 import com.datastax.oss.driver.api.core.config.ClientRoutesConfig;
 import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
 import com.datastax.oss.driver.api.core.metadata.EndPoint;
+import com.datastax.oss.driver.api.core.metadata.Node;
 import com.datastax.oss.driver.internal.core.adminrequest.AdminRequestHandler;
 import com.datastax.oss.driver.internal.core.adminrequest.AdminResult;
 import com.datastax.oss.driver.internal.core.adminrequest.AdminRow;
 import com.datastax.oss.driver.internal.core.channel.DriverChannel;
 import com.datastax.oss.driver.internal.core.clientroutes.ClientRouteRecord;
 import com.datastax.oss.driver.internal.core.context.InternalDriverContext;
+import com.datastax.oss.driver.internal.core.util.AddressUtils;
 import com.datastax.oss.driver.shaded.guava.common.annotations.VisibleForTesting;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.Nullable;
@@ -478,6 +480,48 @@ public class ClientRoutesTopologyMonitor extends DefaultTopologyMonitor {
       broadcastInetAddress = row.getInetAddress("peer");
     }
     return new ClientRoutesEndPoint(this, hostId, broadcastInetAddress, fallback);
+  }
+
+  @Override
+  public boolean reresolvesNodeAddresses() {
+    // A ClientRoutesEndPoint looks its route hostname up on every connect, but only while a route
+    // exists for that host id; without one it falls back to a static, already-resolved address. So
+    // this answers true only while every known node has a live route, and "every" has to mean at
+    // least one: an empty node set (before the first refresh, or after every node was removed) must
+    // not suppress the contact-point fallback at the one moment it is the only way back. A closed
+    // monitor re-resolves nothing at all, however complete its cache still looks.
+    if (closed) {
+      return false;
+    }
+    // Routes first, nodes second, and the order is deliberate rather than a style choice: the two
+    // are published independently, by components that do not share this thread, so a pass
+    // necessarily mixes one snapshot with a possibly newer other. Read this way, a node added
+    // since the routes were published is missing from them and reports false; read the other way
+    // it would be missing from the node set instead, and its absence of a route would go
+    // unnoticed -- claiming a re-resolution that node does not have. The opposite skew is not
+    // covered and is bounded: a route removed since the snapshot still reads as live here, so this
+    // claims a re-resolution the node no longer has for one round, and the next round -- reading
+    // the newer map -- reports false and lets the contact points back in.
+    Map<UUID, ClientRouteRecord> routes = resolvedRoutesCache.get();
+    // getNodes() is already keyed by host id, so iterating its keys is exactly "every known node",
+    // and the node objects themselves are never asked anything.
+    Map<UUID, Node> nodes = context.getMetadataManager().getMetadata().getNodes();
+    if (nodes.isEmpty()) {
+      return false;
+    }
+    for (UUID hostId : nodes.keySet()) {
+      ClientRouteRecord route = routes.get(hostId);
+      // A route reaches DNS only if its address holds a name: resolve() calls
+      // InetAddress.getByName(), which hands an IP literal straight back, so a literal-valued
+      // route re-resolves nothing and must not suppress the contact-point fallback -- that
+      // fallback is the only way such a node ever learns a new address. The address column takes
+      // either form and nothing validates which (scylladb/java-driver#1064), so decide it here,
+      // per record and lexically, without a lookup.
+      if (route == null || AddressUtils.isIpLiteral(route.getHostname())) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

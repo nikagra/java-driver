@@ -29,6 +29,75 @@ datacenter is never populated, so it fired on every session that configured a lo
 contact points actually were. The warning for a configured DC that matches no node in the cluster is
 unchanged. `checkLocalDatacenterCompatibility` is removed, so drop any override of it.
 
+#### The control connection falls back to the contact points by default
+
+`advanced.control-connection.reconnection.fallback-to-original-contact-points` now defaults to
+`true`. Once a control-connection reconnection round has exhausted the live nodes, the original
+contact points are tried again. A contact point given as a hostname is kept unresolved and looked up
+again on each connect, so a cluster that moved to new addresses is found again once the JVM's DNS
+cache (`networkaddress.cache.ttl`) has expired; this is what
+[#215](https://github.com/scylladb/java-driver/issues/215) asked for. A resolved contact point
+(`advanced.resolve-contact-points = true`, or a programmatic `InetSocketAddress` that was already
+resolved) is appended as it is and is not re-resolved.
+
+The cost is one extra connection attempt per contact point per exhausted round: at plan time the
+contact points are hostnames and the live nodes resolved addresses, so the two cannot be
+deduplicated. Set the option to `false` if your contact points are IP literals or their records
+never change, or to keep reconnection rounds short; no contact point is then re-resolved, though
+endpoints that re-resolve on their own still do. A Cloud (SNI) session is exempt, since its
+endpoints re-resolve the proxy name on every connect; a client-routes session is exempt only while
+every known node has a route whose address is a hostname, since an IP-literal route resolves to the
+same address forever.
+
+#### The control node is identified by the address it connected to
+
+The node the control connection reached through an unresolved contact point used to be registered
+under that contact point's host string. It is now registered under the address the connection
+actually reached, bytes and port only, like every node discovered from the peers table.
+
+Under the default `advanced.resolve-contact-points = false` the driver keeps **every** configured
+contact point unresolved, IP literals included, so this is not limited to hostnames. Two kinds of
+contact point are unaffected: one that is already resolved when the driver receives it
+(`resolve-contact-points = true`, or a programmatic `InetSocketAddress` that was already resolved),
+and a custom `EndPoint` given to `SessionBuilder.addContactEndPoint(s)`, which is returned as it is
+whether it resolves or not -- such an endpoint already names a node on its own. Four visible
+consequences:
+
+- Its node metrics move once, from a name derived from the contact point
+  (`nodes.cluster_example_com:9042.*`, `node` tag `cluster.example.com:9042`) to its own address
+  (`nodes.10_0_0_2:9042.*`, `/10.0.0.2:9042`). Every other node already reported that way. For an
+  IP-literal contact point only part of that moves: the Dropwizard prefix is built from the host
+  string, and an IPv4 literal spells that the same way resolved or not, so `contact-points =
+  ["10.0.0.2:9042"]` keeps `nodes.10_0_0_2:9042.*` and only its `node` tag changes, gaining the
+  leading `/` that every peer's tag already carries. An IPv6 literal moves both, since the two
+  spellings differ: `contact-points = ["[::1]:9042"]` goes from `nodes.[::1]:9042.*` to
+  `nodes.0:0:0:0:0:0:0:1:9042.*`. Read the rename off the prefix, not the tag: the tag is the
+  endpoint's `toString()`, and for an IPv6 address that spelling depends on the JVM (bracketed from
+  JDK 14 on), as it already does for every IPv6 peer.
+- Connections opened to it later -- pooled and control alike -- verify TLS against that address (or
+  its reverse-DNS name, under the default `allow-dns-reverse-lookup-san`), exactly as they do for
+  every peer. A single-node cluster reached by hostname with a certificate that names only that
+  hostname needs an IP or PTR subject alternative name, or `hostname-validation = false`. The same
+  endpoint is what those connections pass to `AuthProvider.newAuthenticator` and
+  `onMissingChallenge`, so a provider that picks credentials by endpoint stops matching the
+  contact-point name there too, TLS or no TLS. The control connection's own first authentication is
+  unaffected: protocol init runs before the identity is applied.
+- `Node.getEndPoint().resolve()` for that node returns a resolved address rather than the
+  unresolved host string, so `getAddress()` is no longer `null` there; code that picked the node out
+  of `Metadata.getNodes()` by looking for the contact-point name in `toString()` no longer finds it.
+- A peer row that advertises the control node's own address is now skipped, with a warning naming
+  the misconfiguration (JAVA-2303). That check compares the peer's broadcast RPC address against
+  the control node's endpoint, so it could never match while that endpoint was an unresolved
+  contact point; it matches now. Peer rows for any other address are unaffected. If a peer row
+  legitimately carries the address the client dialled -- two nodes behind one VIP, say -- that node
+  no longer appears in `Metadata.getNodes()` from the peers table.
+
+One further case, if you run a custom `AddressTranslator` or reach the cluster through a VIP or NAT:
+the control node's endpoint is the socket the client dialled, while the same node seen as a peer row
+is `translate(broadcast_rpc_address)`. Where those two disagree, moving the control connection
+rewrites that node's endpoint and resets its metrics -- and with the contact-point fallback now on
+by default, that happens on every DNS-driven recovery rather than about once per session.
+
 ### 4.19.2.1
 
 #### The driver reports a session identifier, and its configuration, at connection time

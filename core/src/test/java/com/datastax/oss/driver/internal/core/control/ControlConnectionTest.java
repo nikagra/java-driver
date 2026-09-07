@@ -22,11 +22,13 @@ import static com.datastax.oss.driver.Assertions.assertThatStage;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.same;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.datastax.oss.driver.api.core.AllNodesFailedException;
 import com.datastax.oss.driver.api.core.loadbalancing.NodeDistance;
 import com.datastax.oss.driver.api.core.metadata.EndPoint;
 import com.datastax.oss.driver.api.core.metadata.Node;
@@ -34,6 +36,7 @@ import com.datastax.oss.driver.api.core.metadata.NodeState;
 import com.datastax.oss.driver.internal.core.channel.ChannelEvent;
 import com.datastax.oss.driver.internal.core.channel.DriverChannel;
 import com.datastax.oss.driver.internal.core.channel.MockChannelFactoryHelper;
+import com.datastax.oss.driver.internal.core.metadata.DefaultEndPoint;
 import com.datastax.oss.driver.internal.core.metadata.DefaultNode;
 import com.datastax.oss.driver.internal.core.metadata.DefaultNodeInfo;
 import com.datastax.oss.driver.internal.core.metadata.DistanceEvent;
@@ -49,6 +52,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
@@ -784,6 +788,182 @@ public class ControlConnectionTest extends ControlConnectionTestBase {
   }
 
   @Test
+  public void should_try_next_node_if_identified_node_became_ignored_during_resolve() {
+    should_try_next_node_if_event_during_contact_point_resolve(true);
+  }
+
+  @Test
+  public void should_try_next_node_if_identified_node_was_forced_down_during_resolve() {
+    should_try_next_node_if_event_during_contact_point_resolve(false);
+  }
+
+  /**
+   * A contact point's identity is only known once its resolve completes, and the event names the
+   * registered metadata node while the placeholder we dialled is what sits in {@code pending} --
+   * two different instances by construction. So the event cannot be matched while the resolve is in
+   * flight, and the check has to run again on the node finally identified. Before that check
+   * existed the control connection settled on a node it had just been told to abandon, and nothing
+   * replayed the event.
+   */
+  private void should_try_next_node_if_event_during_contact_point_resolve(boolean ignored) {
+    // Given -- init on node1, then a reconnection that goes through a contact point
+    when(reconnectionSchedule.nextDelay()).thenReturn(Duration.ofNanos(1));
+    DriverChannel channel1 = newMockDriverChannel(1);
+    DriverChannel channel2 = newMockDriverChannel(2);
+    DriverChannel channel3 = newMockDriverChannel(3);
+    DefaultNode contactPoint = TestNodeFactory.newContactPoint(2, context);
+    UUID resolvedHostId = UUID.randomUUID();
+    DefaultNode resolvedNode = TestNodeFactory.newNode(2, resolvedHostId, context);
+
+    MockChannelFactoryHelper factoryHelper =
+        MockChannelFactoryHelper.builder(channelFactory)
+            .success(node1, channel1) // init
+            .success(contactPoint, channel2) // reconnect through the contact point
+            .success(node1, channel3) // next node, once channel2 is dropped
+            .build();
+
+    CompletionStage<Void> initFuture = controlConnection.init(false, false, false);
+    factoryHelper.waitForCall(node1);
+    assertThatStage(initFuture).isSuccess();
+    verify(eventBus, VERIFY_TIMEOUT).fire(ChannelEvent.channelOpened(node1));
+
+    // Hold the resolve open so the event lands while the contact point is still unidentified
+    CompletableFuture<NodeInfo> pendingResolve = new CompletableFuture<>();
+    TopologyMonitor topologyMonitor = context.getTopologyMonitor();
+    when(topologyMonitor.getChannelNodeInfo(channel2)).thenReturn(pendingResolve);
+    when(metadataManager.registerNode(any()))
+        .thenAnswer(
+            invocation -> {
+              registeredNodes.put(resolvedNode.getHostId(), resolvedNode);
+              return CompletableFuture.completedFuture(resolvedNode);
+            });
+
+    mockQueryPlan(contactPoint, node1);
+    channel1.close();
+    verify(reconnectionSchedule, VERIFY_TIMEOUT).nextDelay();
+    factoryHelper.waitForCall(contactPoint);
+
+    // When -- the node behind that contact point is taken out of service mid-resolve
+    if (ignored) {
+      eventBus.fire(new DistanceEvent(NodeDistance.IGNORED, resolvedNode));
+    } else {
+      eventBus.fire(NodeStateEvent.changed(NodeState.UP, NodeState.FORCED_DOWN, resolvedNode));
+    }
+    pendingResolve.complete(
+        DefaultNodeInfo.builder()
+            .withEndPoint(channel2.getEndPoint())
+            .withHostId(resolvedHostId)
+            .build());
+
+    // Then -- channel2 is dropped rather than adopted, and the next node is tried
+    verify(channel2, VERIFY_TIMEOUT).forceClose();
+    factoryHelper.waitForCall(node1);
+    await().untilAsserted(() -> assertThat(controlConnection.channel()).isEqualTo(channel3));
+    verify(eventBus, never()).fire(ChannelEvent.channelOpened(resolvedNode));
+
+    factoryHelper.verifyNoMoreCalls();
+  }
+
+  @Test
+  public void should_identify_channel_before_any_query_is_sent_on_it() {
+    // The identity has to be on the channel before anything reads it. refreshNodeList(),
+    // refreshNode() and getNewNodeInfo() all take the control node's endpoint from
+    // channel.getEndPoint(), so a topology event arriving while the identity query was still in
+    // flight would identify the control node by the address it was dialled at, and the refresh
+    // after it by the address it answered on -- and reconciling those two rewrites the node's
+    // endpoint and clears its metrics.
+    DriverChannel channel1 = newMockDriverChannel(1);
+    EndPoint dialled = channel1.getEndPoint();
+    EndPoint identity = new DefaultEndPoint(new InetSocketAddress("10.0.0.1", 9042));
+    // The mock channel stores what it is given, as the real one does.
+    AtomicReference<EndPoint> channelEndPoint = new AtomicReference<>(dialled);
+    when(channel1.getEndPoint()).thenAnswer(i -> channelEndPoint.get());
+    doAnswer(
+            i -> {
+              channelEndPoint.set(i.getArgument(0));
+              return null;
+            })
+        .when(channel1)
+        .setEndPoint(any(EndPoint.class));
+
+    DefaultNode contactPoint = TestNodeFactory.newContactPoint(1, context);
+    MockChannelFactoryHelper factoryHelper =
+        MockChannelFactoryHelper.builder(channelFactory).success(contactPoint, channel1).build();
+    mockQueryPlan(contactPoint);
+
+    TopologyMonitor topologyMonitor = context.getTopologyMonitor();
+    when(topologyMonitor.connectedNodeEndPoint(channel1)).thenReturn(identity);
+    AtomicReference<EndPoint> endPointWhenQueried = new AtomicReference<>();
+    when(topologyMonitor.getChannelNodeInfo(channel1))
+        .thenAnswer(
+            i -> {
+              endPointWhenQueried.set(channel1.getEndPoint());
+              return CompletableFuture.completedFuture(
+                  DefaultNodeInfo.builder()
+                      .withEndPoint(channel1.getEndPoint())
+                      .withHostId(UUID.randomUUID())
+                      .build());
+            });
+
+    CompletionStage<Void> initFuture = controlConnection.init(false, false, false);
+    factoryHelper.waitForCall(contactPoint);
+    assertThatStage(initFuture).isSuccess();
+
+    // The monitor's very first query already saw the identity, so no window exists in which a
+    // refresh could have read the contact point instead.
+    assertThat(endPointWhenQueried.get()).isSameAs(identity);
+    assertThat(channel1.getEndPoint()).isSameAs(identity);
+    factoryHelper.verifyNoMoreCalls();
+  }
+
+  @Test
+  public void should_report_dropped_node_in_failure_when_no_candidate_is_usable() {
+    // One contact point in the plan, and the node behind it turns out to be ignored, so there is
+    // nothing left to try. The failure has to name it: an operator otherwise sees the control
+    // connection refusing to come up with nothing saying a channel was opened and deliberately
+    // closed.
+    DriverChannel channel1 = newMockDriverChannel(1);
+    DefaultNode contactPoint = TestNodeFactory.newContactPoint(1, context);
+    UUID resolvedHostId = UUID.randomUUID();
+    DefaultNode resolvedNode = TestNodeFactory.newNode(1, resolvedHostId, context);
+    MockChannelFactoryHelper factoryHelper =
+        MockChannelFactoryHelper.builder(channelFactory).success(contactPoint, channel1).build();
+    mockQueryPlan(contactPoint);
+
+    // Hold the resolve open so the node can be taken out of service while it is unidentified.
+    CompletableFuture<NodeInfo> pendingResolve = new CompletableFuture<>();
+    TopologyMonitor topologyMonitor = context.getTopologyMonitor();
+    when(topologyMonitor.getChannelNodeInfo(channel1)).thenReturn(pendingResolve);
+    when(metadataManager.registerNode(any()))
+        .thenAnswer(
+            invocation -> {
+              registeredNodes.put(resolvedNode.getHostId(), resolvedNode);
+              return CompletableFuture.completedFuture(resolvedNode);
+            });
+
+    CompletionStage<Void> initFuture = controlConnection.init(false, false, false);
+    factoryHelper.waitForCall(contactPoint);
+    eventBus.fire(new DistanceEvent(NodeDistance.IGNORED, resolvedNode));
+    pendingResolve.complete(
+        DefaultNodeInfo.builder()
+            .withEndPoint(channel1.getEndPoint())
+            .withHostId(resolvedHostId)
+            .build());
+
+    assertThatStage(initFuture)
+        .isFailed(
+            error -> {
+              // NoNodeAvailableException is also an AllNodesFailedException, so the errors are
+              // what discriminates: it carries none.
+              assertThat(error).isInstanceOf(AllNodesFailedException.class);
+              assertThat(((AllNodesFailedException) error).getAllErrors())
+                  .containsOnlyKeys(contactPoint);
+            });
+    verify(channel1, VERIFY_TIMEOUT).forceClose();
+    factoryHelper.verifyNoMoreCalls();
+  }
+
+  @Test
   public void should_adopt_identified_endpoint_without_consulting_equals() {
     // Given -- init normally with node1, then reconnect through a contact point
     when(reconnectionSchedule.nextDelay()).thenReturn(Duration.ofNanos(1));
@@ -1036,6 +1216,128 @@ public class ControlConnectionTest extends ControlConnectionTestBase {
     assertThatStage(initFuture).isSuccess();
     TopologyMonitor topologyMonitor = context.getTopologyMonitor();
     verify(topologyMonitor, never()).getChannelNodeInfo(any(DriverChannel.class));
+
+    factoryHelper.verifyNoMoreCalls();
+  }
+
+  @Test
+  public void should_not_derive_an_identity_for_a_node_that_already_has_a_host_id() {
+    // Given -- node1 is a metadata node, so its endpoint is one the driver chose for it. That
+    // endpoint may be an unresolved hostname on purpose: an address translator configured with
+    // resolve-addresses = false hands out names that are looked up again on every connection.
+    DriverChannel channel1 = newMockDriverChannel(1);
+    MockChannelFactoryHelper factoryHelper =
+        MockChannelFactoryHelper.builder(channelFactory).success(node1, channel1).build();
+    TopologyMonitor topologyMonitor = context.getTopologyMonitor();
+    when(topologyMonitor.connectedNodeEndPoint(channel1))
+        .thenReturn(new DefaultEndPoint(new InetSocketAddress("10.0.0.1", 9042)));
+
+    // When
+    CompletionStage<Void> initFuture = controlConnection.init(false, false, false);
+    factoryHelper.waitForCall(node1);
+
+    // Then -- the monitor is not even asked, so no implementation of the hook can freeze such a
+    // node to the address this one connection reached. Left to the next full node refresh, that
+    // rewrite would also persist onto the node and clear its metrics (NodesRefresh#copyInfos to
+    // DefaultNode#setEndPoint).
+    assertThatStage(initFuture).isSuccess();
+    verify(topologyMonitor, never()).connectedNodeEndPoint(any(DriverChannel.class));
+    verify(channel1, never()).setEndPoint(any(EndPoint.class));
+
+    factoryHelper.verifyNoMoreCalls();
+  }
+
+  @Test
+  public void should_try_next_node_if_identifying_the_control_node_throws() {
+    // Given -- the monitor is pluggable, and this hook is asked before the channel is adopted, so a
+    // throw used to reach nothing but the catch-all at the end of the init callback: the channel
+    // stayed open with no reference to it anywhere, and the round completed neither way, so a
+    // Reconnection waiting on it never scheduled another attempt.
+    DefaultNode contactPoint1 = TestNodeFactory.newContactPoint(1, context);
+    mockQueryPlan(contactPoint1, node2);
+    DriverChannel channel1 = newMockDriverChannel(1);
+    DriverChannel channel2 = newMockDriverChannel(2);
+    MockChannelFactoryHelper factoryHelper =
+        MockChannelFactoryHelper.builder(channelFactory)
+            .success(contactPoint1, channel1)
+            .success(node2, channel2)
+            .build();
+    TopologyMonitor topologyMonitor = context.getTopologyMonitor();
+    when(topologyMonitor.connectedNodeEndPoint(channel1))
+        .thenThrow(new IllegalStateException("mock monitor failure"));
+
+    // When
+    CompletionStage<Void> initFuture = controlConnection.init(false, false, false);
+    factoryHelper.waitForCall(contactPoint1);
+
+    // Then -- the candidate is dropped like any other, and nothing is asked of its channel
+    factoryHelper.waitForCall(node2);
+    assertThatStage(initFuture)
+        .isSuccess(v -> assertThat(controlConnection.channel()).isEqualTo(channel2));
+    verify(channel1, VERIFY_TIMEOUT).forceClose();
+    verify(topologyMonitor, never()).getChannelNodeInfo(channel1);
+
+    factoryHelper.verifyNoMoreCalls();
+  }
+
+  @Test
+  public void should_report_the_monitor_error_when_no_candidate_can_be_identified() {
+    // Given -- one contact point, and the monitor throws for it
+    DefaultNode contactPoint = TestNodeFactory.newContactPoint(1, context);
+    mockQueryPlan(contactPoint);
+    DriverChannel channel1 = newMockDriverChannel(1);
+    MockChannelFactoryHelper factoryHelper =
+        MockChannelFactoryHelper.builder(channelFactory).success(contactPoint, channel1).build();
+    IllegalStateException monitorError = new IllegalStateException("mock monitor failure");
+    TopologyMonitor topologyMonitor = context.getTopologyMonitor();
+    when(topologyMonitor.connectedNodeEndPoint(channel1)).thenThrow(monitorError);
+
+    // When
+    CompletionStage<Void> initFuture = controlConnection.init(false, false, false);
+    factoryHelper.waitForCall(contactPoint);
+
+    // Then -- the round completes, and with the cause attached: an operator otherwise sees a
+    // control connection that never comes up and a log line about an unexpected exception.
+    assertThatStage(initFuture)
+        .isFailed(
+            error -> {
+              assertThat(error).isInstanceOf(AllNodesFailedException.class);
+              assertThat(((AllNodesFailedException) error).getAllErrors())
+                  .containsOnlyKeys(contactPoint);
+              assertThat(((AllNodesFailedException) error).getAllErrors().get(contactPoint))
+                  .containsExactly(monitorError);
+            });
+    verify(channel1, VERIFY_TIMEOUT).forceClose();
+
+    factoryHelper.verifyNoMoreCalls();
+  }
+
+  @Test
+  public void should_try_next_node_if_getChannelNodeInfo_throws_synchronously() {
+    // Given -- the same hole one call later: this one is reached with the channel already adopted,
+    // so the control connection could still reclaim it, but the round was stranded just the same.
+    DefaultNode contactPoint1 = TestNodeFactory.newContactPoint(1, context);
+    mockQueryPlan(contactPoint1, node2);
+    DriverChannel channel1 = newMockDriverChannel(1);
+    DriverChannel channel2 = newMockDriverChannel(2);
+    MockChannelFactoryHelper factoryHelper =
+        MockChannelFactoryHelper.builder(channelFactory)
+            .success(contactPoint1, channel1)
+            .success(node2, channel2)
+            .build();
+    TopologyMonitor topologyMonitor = context.getTopologyMonitor();
+    when(topologyMonitor.getChannelNodeInfo(channel1))
+        .thenThrow(new IllegalStateException("mock monitor failure"));
+
+    // When
+    CompletionStage<Void> initFuture = controlConnection.init(false, false, false);
+    factoryHelper.waitForCall(contactPoint1);
+
+    // Then -- reported as a failed resolve, which this method already knew how to handle
+    factoryHelper.waitForCall(node2);
+    assertThatStage(initFuture)
+        .isSuccess(v -> assertThat(controlConnection.channel()).isEqualTo(channel2));
+    verify(channel1, VERIFY_TIMEOUT).forceClose();
 
     factoryHelper.verifyNoMoreCalls();
   }

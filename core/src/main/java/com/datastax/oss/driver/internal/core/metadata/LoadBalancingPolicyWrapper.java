@@ -193,11 +193,19 @@ public class LoadBalancingPolicyWrapper implements AutoCloseable {
     // is an immutable QueryPlan (add()/addAll() throw), so concatenate rather than mutate. The
     // nodes retained by MetadataManager are appended, not fresh copies: their identity stays stable
     // across reconnection rounds, and no throwaway node is minted per round.
+    //
+    // A monitor that re-resolves node addresses itself (the Cloud SNI proxy, client routes with
+    // full coverage) keeps them fresh without this fallback, and appending raw contact points could
+    // resurrect nodes it has removed -- unless the live-node plan is empty, in which case there is
+    // nothing else to try. isEmpty() on a policy's plan is size() == 0 through AbstractCollection;
+    // QueryPlan's contract names this call, since it makes "size() never throws" load-bearing.
     if (state == State.RUNNING
         && context
             .getConfig()
             .getDefaultProfile()
-            .getBoolean(DefaultDriverOption.CONTROL_CONNECTION_RECONNECT_CONTACT_POINTS)) {
+            .getBoolean(DefaultDriverOption.CONTROL_CONNECTION_RECONNECT_CONTACT_POINTS)
+        && (!context.getTopologyMonitor().reresolvesNodeAddresses()
+            || regularQueryPlan.isEmpty())) {
       Object[] contactNodes = context.getMetadataManager().getContactPoints().toArray();
       ArrayUtils.shuffleHead(contactNodes, contactNodes.length);
       return new CompositeQueryPlan(regularQueryPlan, new SimpleQueryPlan(contactNodes));

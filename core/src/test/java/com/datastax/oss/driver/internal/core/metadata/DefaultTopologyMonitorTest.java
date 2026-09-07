@@ -449,7 +449,6 @@ public class DefaultTopologyMonitorTest {
   public void should_identify_control_node_by_the_address_the_channel_reached() throws Exception {
     // Given -- a hostname contact point (unresolved by default) whose channel Netty connected to
     // 127.0.0.1, labelling the address with the queried name as its default resolver does
-    UUID hostId = UUID.randomUUID();
     when(channel.getEndPoint())
         .thenReturn(
             new DefaultEndPoint(InetSocketAddress.createUnresolved("cluster.example.com", 9042)));
@@ -457,26 +456,84 @@ public class DefaultTopologyMonitorTest {
         .thenReturn(
             new InetSocketAddress(
                 InetAddress.getByAddress("cluster.example.com", new byte[] {127, 0, 0, 1}), 9042));
-    topologyMonitor.stubQueries(
-        new StubbedQuery(
-            "SELECT * FROM system.local WHERE key='local'", mockResult(mockLocalRow(1, hostId))));
 
-    // When
-    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
+    // When -- ControlConnection asks who this channel reached, before sending anything on it
+    EndPoint endPoint = topologyMonitor.connectedNodeEndPoint(channel);
 
     // Then -- identified by the reached address, bytes and port only, as a peer row would be
+    assertThat(endPoint).isInstanceOf(DefaultEndPoint.class);
+    InetSocketAddress address = (InetSocketAddress) endPoint.resolve();
+    assertThat(address.isUnresolved()).isFalse();
+    assertThat(address.getAddress().getHostAddress()).isEqualTo("127.0.0.1");
+    assertThat(address.getHostString()).isEqualTo("127.0.0.1");
+    assertThat(endPoint.asMetricPrefix()).isEqualTo("127_0_0_1:9042");
+    assertThat(endPoint.toString()).isEqualTo("/127.0.0.1:9042");
+  }
+
+  @Test
+  public void should_identify_control_node_reached_through_an_ip_literal_contact_point()
+      throws Exception {
+    // Given -- the default keeps every contact point unresolved, IP literals included, so the
+    // derivation fires for them too. What that changes is what the upgrade guide claims, and the
+    // two families differ: an IPv4 literal spells its host string the same way resolved or not, so
+    // only the metric tag moves; the two IPv6 spellings differ, so the prefix moves as well.
+    when(channel.getEndPoint())
+        .thenReturn(new DefaultEndPoint(InetSocketAddress.createUnresolved("10.0.0.2", 9042)));
+    when(channel.remoteAddress())
+        .thenReturn(
+            new InetSocketAddress(InetAddress.getByAddress(null, new byte[] {10, 0, 0, 2}), 9042));
+
+    // When
+    EndPoint v4 = topologyMonitor.connectedNodeEndPoint(channel);
+
+    // Then -- same Dropwizard prefix as before, tag gains the leading slash every peer's carries
+    assertThat(v4.asMetricPrefix()).isEqualTo("10_0_0_2:9042");
+    assertThat(v4.toString()).isEqualTo("/10.0.0.2:9042");
+
+    // Given -- ContactPoints does not strip the brackets, so an IPv6 literal contact point really
+    // did report itself as "[::1]:9042"
+    DefaultEndPoint configured =
+        new DefaultEndPoint(InetSocketAddress.createUnresolved("[::1]", 9042));
+    assertThat(configured.asMetricPrefix()).isEqualTo("[::1]:9042");
+    when(channel.getEndPoint()).thenReturn(configured);
+    when(channel.remoteAddress())
+        .thenReturn(new InetSocketAddress(InetAddress.getByName("::1"), 9042));
+
+    // When
+    EndPoint v6 = topologyMonitor.connectedNodeEndPoint(channel);
+
+    // Then -- renamed, which is the one metric move the guide promises for a literal. The prefix
+    // is pinned exactly, since getHostString() reads the same on every JDK; the tag is toString(),
+    // which brackets an IPv6 literal from JDK 14 on ("/[0:0:0:0:0:0:0:1]:9042" on 17,
+    // "/0:0:0:0:0:0:0:1:9042" on 11 -- both measured), so compare it against what the running JDK
+    // prints for a peer's endpoint. That is the claim in any case: a peer is built the same way,
+    // new DefaultEndPoint(new InetSocketAddress(address, port)).
+    EndPoint asAPeerWouldPrint =
+        new DefaultEndPoint(new InetSocketAddress(InetAddress.getByName("::1"), 9042));
+    assertThat(v6.asMetricPrefix()).isEqualTo("0:0:0:0:0:0:0:1:9042");
+    assertThat(v6.toString()).isEqualTo(asAPeerWouldPrint.toString());
+  }
+
+  @Test
+  public void should_take_the_local_row_endpoint_from_the_channel() throws Exception {
+    // The identity is applied to the channel before any query is sent, so every method that reads
+    // the control node's endpoint has to read it from there -- this one, refreshNodeList(),
+    // refreshNode() and getNewNodeInfo() alike. Deriving it here as well would let two of them
+    // disagree, and reconciling that rewrites the node's endpoint and clears its metrics.
+    EndPoint identity =
+        new DefaultEndPoint(
+            new InetSocketAddress(InetAddress.getByAddress(null, new byte[] {127, 0, 0, 1}), 9042));
+    when(channel.getEndPoint()).thenReturn(identity);
+    topologyMonitor.stubQueries(
+        new StubbedQuery(
+            "SELECT * FROM system.local WHERE key='local'",
+            mockResult(mockLocalRow(1, UUID.randomUUID()))));
+
+    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
+
     assertThatStage(futureInfo)
-        .isSuccess(
-            info -> {
-              EndPoint endPoint = info.getEndPoint();
-              assertThat(endPoint).isInstanceOf(DefaultEndPoint.class);
-              InetSocketAddress address = (InetSocketAddress) endPoint.resolve();
-              assertThat(address.isUnresolved()).isFalse();
-              assertThat(address.getAddress().getHostAddress()).isEqualTo("127.0.0.1");
-              assertThat(address.getHostString()).isEqualTo("127.0.0.1");
-              assertThat(endPoint.asMetricPrefix()).isEqualTo("127_0_0_1:9042");
-              assertThat(endPoint.toString()).isEqualTo("/127.0.0.1:9042");
-            });
+        .isSuccess(info -> assertThat(info.getEndPoint()).isSameAs(identity));
+    verify(channel, never()).remoteAddress();
   }
 
   @Test
@@ -488,17 +545,10 @@ public class DefaultTopologyMonitorTest {
             new InetSocketAddress(
                 InetAddress.getByAddress("cluster.example.com", new byte[] {127, 0, 0, 1}), 9042));
     when(channel.getEndPoint()).thenReturn(configured);
-    topologyMonitor.stubQueries(
-        new StubbedQuery(
-            "SELECT * FROM system.local WHERE key='local'",
-            mockResult(mockLocalRow(1, UUID.randomUUID()))));
 
-    // When
-    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
-
-    // Then -- returned as configured, without even asking the channel where it landed
-    assertThatStage(futureInfo)
-        .isSuccess(info -> assertThat(info.getEndPoint()).isSameAs(configured));
+    // Then -- returned as configured, without even asking the channel where it landed: a resolved
+    // contact point already names a node, and keeps identifying it by that name deliberately
+    assertThat(topologyMonitor.connectedNodeEndPoint(channel)).isSameAs(configured);
     verify(channel, never()).remoteAddress();
   }
 
@@ -510,17 +560,8 @@ public class DefaultTopologyMonitorTest {
         new DefaultEndPoint(InetSocketAddress.createUnresolved("cluster.example.com", 9042));
     when(channel.getEndPoint()).thenReturn(configured);
     when(channel.remoteAddress()).thenReturn(new LocalAddress("test"));
-    topologyMonitor.stubQueries(
-        new StubbedQuery(
-            "SELECT * FROM system.local WHERE key='local'",
-            mockResult(mockLocalRow(1, UUID.randomUUID()))));
 
-    // When
-    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
-
-    // Then
-    assertThatStage(futureInfo)
-        .isSuccess(info -> assertThat(info.getEndPoint()).isSameAs(configured));
+    assertThat(topologyMonitor.connectedNodeEndPoint(channel)).isSameAs(configured);
   }
 
   @Test
@@ -528,17 +569,8 @@ public class DefaultTopologyMonitorTest {
     // Given -- a third-party EndPoint implementation
     EndPoint configured = mock(EndPoint.class);
     when(channel.getEndPoint()).thenReturn(configured);
-    topologyMonitor.stubQueries(
-        new StubbedQuery(
-            "SELECT * FROM system.local WHERE key='local'",
-            mockResult(mockLocalRow(1, UUID.randomUUID()))));
 
-    // When
-    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
-
-    // Then
-    assertThatStage(futureInfo)
-        .isSuccess(info -> assertThat(info.getEndPoint()).isSameAs(configured));
+    assertThat(topologyMonitor.connectedNodeEndPoint(channel)).isSameAs(configured);
     verify(channel, never()).remoteAddress();
   }
 

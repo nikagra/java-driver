@@ -19,6 +19,7 @@ package com.datastax.oss.driver.internal.core.metadata;
 
 import com.datastax.oss.driver.api.core.AsyncAutoCloseable;
 import com.datastax.oss.driver.api.core.loadbalancing.LoadBalancingPolicy;
+import com.datastax.oss.driver.api.core.metadata.EndPoint;
 import com.datastax.oss.driver.api.core.metadata.Node;
 import com.datastax.oss.driver.api.core.session.Session;
 import com.datastax.oss.driver.internal.core.channel.DriverChannel;
@@ -141,4 +142,70 @@ public interface TopologyMonitor extends AsyncAutoCloseable {
    * {@link DefaultTopologyMonitor}) should override this method.
    */
   default void resetColumnCaches() {}
+
+  /**
+   * Whether this monitor re-resolves node addresses on every connection attempt (for example by
+   * handing out a proxy hostname to be looked up at connect time), rather than registering an
+   * address resolved once.
+   *
+   * <p>Implementations must report {@code true} only where re-resolution can actually happen: a
+   * monitor that hands out an address it looked up once, or a name it will not look up again, has
+   * to answer {@code false}, or it silently suppresses the fallback for a node whose address can
+   * then never change.
+   *
+   * <p>When {@code true}, the control connection's reconnection plan does not append the original
+   * contact points as a DNS re-resolution fallback (see {@code
+   * advanced.control-connection.reconnection.fallback-to-original-contact-points}) unless the
+   * live-node plan is empty: the monitor keeps addresses fresh on its own, and appending raw
+   * contact points could resurrect nodes it has removed.
+   *
+   * <p>The default is {@code false}, which is right for {@link DefaultTopologyMonitor}: peers hold
+   * a resolved address from the peers table, and the node the control connection reached is
+   * registered under the address it reached, so neither re-reads DNS. Proxy-based monitors override
+   * this.
+   */
+  default boolean reresolvesNodeAddresses() {
+    return false;
+  }
+
+  /**
+   * The endpoint that the node at the other end of {@code channel} should be identified by, called
+   * once when the channel is adopted as the control connection.
+   *
+   * <p>Asked only for a candidate the driver has not identified yet -- one with no host id, which
+   * is to say a contact point. A node that has a host id keeps the endpoint the driver already
+   * chose for it: that endpoint may be an unresolved hostname on purpose (an address translator
+   * configured to resolve on every connection, {@code advanced.address-translator.resolve-addresses
+   * = false}), and replacing it with the address one connection reached would freeze it there and
+   * end the re-resolution it exists for.
+   *
+   * <p>Answered before the channel is adopted: before {@code ControlConnection} publishes it and
+   * before the identity query is sent on it -- though after protocol init and the TLS handshake,
+   * which ran against the configured endpoint. That ordering is what lets every later read of
+   * {@code channel.getEndPoint()} -- this monitor's own {@code refreshNodeList()}, {@code
+   * refreshNode()} and {@code getNewNodeInfo()} included -- see the endpoint returned here: {@code
+   * getChannelNodeInfo} takes the local row's endpoint straight off the channel, so the node
+   * registered for it carries this very instance. Deriving it later would leave a window in which
+   * one node refresh identifies the control node by the address it was dialled at and the next one
+   * by the address it answered on, and reconciling those two rewrites the node's endpoint and
+   * clears its metrics ({@code NodesRefresh#copyInfos} to {@code DefaultNode#setEndPoint}).
+   *
+   * <p>A monitor that can only name the node from the identity row itself (the Cloud SNI proxy,
+   * client routes) is the exception to that: it returns the configured endpoint here, and {@code
+   * ControlConnection} upgrades the channel's endpoint once the row arrives -- at a point where the
+   * node does not exist yet, so nothing has compared it.
+   *
+   * <p>The default returns the channel's configured endpoint, which is right for any monitor whose
+   * endpoints already identify a node on their own (the Cloud SNI proxy, client routes). {@link
+   * DefaultTopologyMonitor} overrides it for the one case where the configured endpoint names no
+   * node in particular: an unresolved contact point.
+   *
+   * <p>May return {@code null} to leave the channel's configured endpoint alone. Throwing is
+   * tolerated but pointless: {@code ControlConnection} closes the channel, records the error and
+   * moves on to the next candidate, so a throw costs this candidate its turn in the reconnection
+   * round and is reported in that round's {@code AllNodesFailedException}.
+   */
+  default EndPoint connectedNodeEndPoint(DriverChannel channel) {
+    return channel.getEndPoint();
+  }
 }

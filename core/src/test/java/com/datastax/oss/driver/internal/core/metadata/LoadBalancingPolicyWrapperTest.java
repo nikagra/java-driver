@@ -80,6 +80,7 @@ public class LoadBalancingPolicyWrapperTest {
   private EventBus eventBus;
   @Mock private MetadataManager metadataManager;
   @Mock private Metadata metadata;
+  @Mock private TopologyMonitor topologyMonitor;
   @Mock protected MetricsFactory metricsFactory;
   @Captor private ArgumentCaptor<Map<UUID, Node>> initNodesCaptor;
 
@@ -103,6 +104,8 @@ public class LoadBalancingPolicyWrapperTest {
     when(metadata.getNodes()).thenReturn(allNodes);
     when(metadataManager.getContactPoints()).thenReturn(contactPoints);
     when(context.getMetadataManager()).thenReturn(metadataManager);
+    // Unstubbed, reresolvesNodeAddresses() answers false: the default monitor's answer.
+    when(context.getTopologyMonitor()).thenReturn(topologyMonitor);
 
     when(context.getConfig()).thenReturn(config);
     when(config.getDefaultProfile()).thenReturn(defaultProfile);
@@ -266,6 +269,39 @@ public class LoadBalancingPolicyWrapperTest {
     // Then — the contact points are read once and appear once.
     verify(metadataManager, times(1)).getContactPoints();
     assertThat(queryPlan).containsExactlyInAnyOrder(node1, node2);
+  }
+
+  @Test
+  public void should_not_append_contact_points_when_topology_monitor_reresolves_addresses() {
+    // Given -- the flag is on, but the monitor re-resolves node addresses on its own (the Cloud SNI
+    // proxy, or client routes with full coverage)
+    when(defaultProfile.getBoolean(DefaultDriverOption.CONTROL_CONNECTION_RECONNECT_CONTACT_POINTS))
+        .thenReturn(true);
+    when(topologyMonitor.reresolvesNodeAddresses()).thenReturn(true);
+    wrapper.init();
+
+    // When
+    Queue<Node> queryPlan = wrapper.newControlReconnectionQueryPlan();
+
+    // Then -- the policy's plan as is: the monitor keeps addresses fresh, and appending raw contact
+    // points could resurrect nodes it has removed
+    assertThat(queryPlan).isSameAs(defaultPolicyQueryPlan);
+  }
+
+  @Test
+  public void should_append_contact_points_when_query_plan_is_empty_even_if_monitor_reresolves() {
+    // Given -- the same monitor, but the policy has no live node to offer
+    when(defaultProfile.getBoolean(DefaultDriverOption.CONTROL_CONNECTION_RECONNECT_CONTACT_POINTS))
+        .thenReturn(true);
+    when(topologyMonitor.reresolvesNodeAddresses()).thenReturn(true);
+    wrapper.init();
+    when(policy1.newQueryPlan(null, null)).thenReturn(QueryPlan.EMPTY);
+
+    // When
+    Queue<Node> queryPlan = wrapper.newControlReconnectionQueryPlan();
+
+    // Then -- with nothing else to try, the contact points are the only way back
+    assertThat(queryPlan).containsExactlyInAnyOrderElementsOf(contactPoints);
   }
 
   @Test

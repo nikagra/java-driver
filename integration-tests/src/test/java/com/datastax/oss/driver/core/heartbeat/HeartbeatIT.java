@@ -235,6 +235,10 @@ public class HeartbeatIT {
             .withDuration(DefaultDriverOption.HEARTBEAT_TIMEOUT, Duration.ofMillis(500))
             .withDuration(DefaultDriverOption.CONNECTION_INIT_QUERY_TIMEOUT, Duration.ofSeconds(2))
             .withDuration(DefaultDriverOption.RECONNECTION_MAX_DELAY, Duration.ofSeconds(1))
+            // These tests count OPTIONS requests as heartbeats (countHeartbeats() filters on the
+            // query text alone), and every contact point the reconnection fallback appends sends
+            // one during its protocol init. Keep reconnection rounds to the live nodes.
+            .withBoolean(DefaultDriverOption.CONTROL_CONNECTION_RECONNECT_CONTACT_POINTS, false)
             .build();
     return SessionUtils.newSession(SIMULACRON_RULE, loader);
   }
