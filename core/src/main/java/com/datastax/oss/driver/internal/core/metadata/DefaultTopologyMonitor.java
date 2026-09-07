@@ -30,6 +30,7 @@ import com.datastax.oss.driver.internal.core.adminrequest.UnexpectedResponseExce
 import com.datastax.oss.driver.internal.core.channel.DriverChannel;
 import com.datastax.oss.driver.internal.core.context.InternalDriverContext;
 import com.datastax.oss.driver.internal.core.control.ControlConnection;
+import com.datastax.oss.driver.internal.core.util.AddressUtils;
 import com.datastax.oss.driver.internal.core.util.concurrent.CompletableFutures;
 import com.datastax.oss.driver.shaded.guava.common.annotations.VisibleForTesting;
 import com.datastax.oss.driver.shaded.guava.common.collect.ImmutableList;
@@ -350,7 +351,7 @@ public class DefaultTopologyMonitor implements TopologyMonitor {
     if (closeFuture.isDone()) {
       return CompletableFutures.failedFuture(new IllegalStateException("closed"));
     }
-    EndPoint localEndPoint = channel.getEndPoint();
+    EndPoint localEndPoint = connectedNodeEndPoint(channel);
     return query(channel, buildQuery(localColumns, "system.local", "key='local'"))
         .thenApply(
             result -> {
@@ -622,6 +623,39 @@ public class DefaultTopologyMonitor implements TopologyMonitor {
         .withExtra(DseNodeProperties.JMX_PORT, row.getInteger("jmx_port"));
 
     return builder;
+  }
+
+  /**
+   * The endpoint to register the node at the other end of {@code channel} under, when the node is
+   * identified for the first time.
+   *
+   * <p>A contact point's endpoint is an unresolved name by default, and that name is not the
+   * node's: every node ever reached through the contact point would be registered under it, and
+   * with the contact-point reconnection fallback each control-connection move would rewrite a
+   * node's endpoint ({@code NodesRefresh#copyInfos} to {@code DefaultNode#setEndPoint}, which
+   * clears that node's metrics). So the node is identified by the address the channel reached,
+   * bytes and port only, as a peer row identifies it; the resolver's hostname label is stripped
+   * ({@link AddressUtils#stripHostName}) so the metric prefix and tag are a function of the address
+   * alone.
+   *
+   * <p>Anything else is returned as configured: a resolved endpoint ({@code resolve-contact-points
+   * = true}, or a programmatic resolved address), a third-party {@link EndPoint}, or a channel
+   * whose remote address is not an {@link InetSocketAddress}. For the default deployment this moves
+   * the control node's metric name from the contact point's name to its own address, once, and pool
+   * connections opened to it later verify TLS against that address, like every peer's.
+   */
+  private static EndPoint connectedNodeEndPoint(DriverChannel channel) {
+    EndPoint configured = channel.getEndPoint();
+    if (!(configured instanceof DefaultEndPoint)
+        || !((DefaultEndPoint) configured).resolve().isUnresolved()) {
+      return configured;
+    }
+    SocketAddress remote = channel.remoteAddress();
+    if (!(remote instanceof InetSocketAddress)) {
+      return configured;
+    }
+    InetSocketAddress identity = AddressUtils.stripHostName((InetSocketAddress) remote);
+    return identity == null ? configured : new DefaultEndPoint(identity);
   }
 
   /**

@@ -38,6 +38,7 @@ import com.datastax.oss.driver.api.core.addresstranslation.AddressTranslator;
 import com.datastax.oss.driver.api.core.config.DefaultDriverOption;
 import com.datastax.oss.driver.api.core.config.DriverConfig;
 import com.datastax.oss.driver.api.core.config.DriverExecutionProfile;
+import com.datastax.oss.driver.api.core.metadata.EndPoint;
 import com.datastax.oss.driver.api.core.ssl.SslEngineFactory;
 import com.datastax.oss.driver.internal.core.addresstranslation.PassThroughAddressTranslator;
 import com.datastax.oss.driver.internal.core.adminrequest.AdminResult;
@@ -59,6 +60,7 @@ import com.google.common.collect.Streams;
 import com.tngtech.java.junit.dataprovider.DataProvider;
 import com.tngtech.java.junit.dataprovider.DataProviderRunner;
 import com.tngtech.java.junit.dataprovider.UseDataProvider;
+import io.netty.channel.local.LocalAddress;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
@@ -441,6 +443,103 @@ public class DefaultTopologyMonitorTest {
               assertThat(error.getMessage())
                   .contains("Expected a row in system.local for node info resolution");
             });
+  }
+
+  @Test
+  public void should_identify_control_node_by_the_address_the_channel_reached() throws Exception {
+    // Given -- a hostname contact point (unresolved by default) whose channel Netty connected to
+    // 127.0.0.1, labelling the address with the queried name as its default resolver does
+    UUID hostId = UUID.randomUUID();
+    when(channel.getEndPoint())
+        .thenReturn(
+            new DefaultEndPoint(InetSocketAddress.createUnresolved("cluster.example.com", 9042)));
+    when(channel.remoteAddress())
+        .thenReturn(
+            new InetSocketAddress(
+                InetAddress.getByAddress("cluster.example.com", new byte[] {127, 0, 0, 1}), 9042));
+    topologyMonitor.stubQueries(
+        new StubbedQuery(
+            "SELECT * FROM system.local WHERE key='local'", mockResult(mockLocalRow(1, hostId))));
+
+    // When
+    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
+
+    // Then -- identified by the reached address, bytes and port only, as a peer row would be
+    assertThatStage(futureInfo)
+        .isSuccess(
+            info -> {
+              EndPoint endPoint = info.getEndPoint();
+              assertThat(endPoint).isInstanceOf(DefaultEndPoint.class);
+              InetSocketAddress address = (InetSocketAddress) endPoint.resolve();
+              assertThat(address.isUnresolved()).isFalse();
+              assertThat(address.getAddress().getHostAddress()).isEqualTo("127.0.0.1");
+              assertThat(address.getHostString()).isEqualTo("127.0.0.1");
+              assertThat(endPoint.asMetricPrefix()).isEqualTo("127_0_0_1:9042");
+              assertThat(endPoint.toString()).isEqualTo("/127.0.0.1:9042");
+            });
+  }
+
+  @Test
+  public void should_keep_a_resolved_channel_endpoint_as_the_node_endpoint() throws Exception {
+    // Given -- a resolved contact point (resolve-contact-points = true, or a programmatic resolved
+    // address), labelled with the name the reached address would carry
+    EndPoint configured =
+        new DefaultEndPoint(
+            new InetSocketAddress(
+                InetAddress.getByAddress("cluster.example.com", new byte[] {127, 0, 0, 1}), 9042));
+    when(channel.getEndPoint()).thenReturn(configured);
+    topologyMonitor.stubQueries(
+        new StubbedQuery(
+            "SELECT * FROM system.local WHERE key='local'",
+            mockResult(mockLocalRow(1, UUID.randomUUID()))));
+
+    // When
+    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
+
+    // Then -- returned as configured, without even asking the channel where it landed
+    assertThatStage(futureInfo)
+        .isSuccess(info -> assertThat(info.getEndPoint()).isSameAs(configured));
+    verify(channel, never()).remoteAddress();
+  }
+
+  @Test
+  public void should_keep_channel_endpoint_when_remote_address_is_not_an_inet_address() {
+    // Given -- an unresolved contact point, but Netty reports no InetSocketAddress for the channel
+    // (a LocalChannel here): there is nothing to identify the node by
+    EndPoint configured =
+        new DefaultEndPoint(InetSocketAddress.createUnresolved("cluster.example.com", 9042));
+    when(channel.getEndPoint()).thenReturn(configured);
+    when(channel.remoteAddress()).thenReturn(new LocalAddress("test"));
+    topologyMonitor.stubQueries(
+        new StubbedQuery(
+            "SELECT * FROM system.local WHERE key='local'",
+            mockResult(mockLocalRow(1, UUID.randomUUID()))));
+
+    // When
+    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
+
+    // Then
+    assertThatStage(futureInfo)
+        .isSuccess(info -> assertThat(info.getEndPoint()).isSameAs(configured));
+  }
+
+  @Test
+  public void should_keep_a_non_default_endpoint_untouched() {
+    // Given -- a third-party EndPoint implementation
+    EndPoint configured = mock(EndPoint.class);
+    when(channel.getEndPoint()).thenReturn(configured);
+    topologyMonitor.stubQueries(
+        new StubbedQuery(
+            "SELECT * FROM system.local WHERE key='local'",
+            mockResult(mockLocalRow(1, UUID.randomUUID()))));
+
+    // When
+    CompletionStage<NodeInfo> futureInfo = topologyMonitor.getChannelNodeInfo(channel);
+
+    // Then
+    assertThatStage(futureInfo)
+        .isSuccess(info -> assertThat(info.getEndPoint()).isSameAs(configured));
+    verify(channel, never()).remoteAddress();
   }
 
   @Test

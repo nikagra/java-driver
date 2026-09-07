@@ -25,7 +25,6 @@ package com.datastax.oss.driver.core.resolver;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import com.datastax.oss.driver.api.core.CqlSession;
@@ -39,6 +38,7 @@ import com.datastax.oss.driver.api.testinfra.ccm.CcmBridge;
 import com.datastax.oss.driver.categories.IsolatedTests;
 import com.datastax.oss.driver.internal.core.config.typesafe.DefaultProgrammaticDriverConfigLoaderBuilder;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
@@ -101,15 +101,22 @@ public class MockResolverIT {
         for (Node node : nodes) {
           LOG.trace("Found metadata node: {}", node);
         }
-        Set<Node> filteredNodes;
-        filteredNodes =
+        // The node the control connection came up on is identified by the address it reached, not
+        // by the contact point it was reached through, so select it by that address.
+        String reachedIp = ccmBridge.getNodeIpAddress(1);
+        Set<Node> filteredNodes =
             nodes.stream()
-                .filter(x -> x.toString().contains("test.cluster.fake"))
+                .filter(x -> reachedIp.equals(hostAddressOf(x)))
                 .collect(Collectors.toSet());
         assertThat(filteredNodes).hasSize(1);
-        InetSocketAddress address =
-            (InetSocketAddress) filteredNodes.iterator().next().getEndPoint().resolve();
-        assertTrue(address.isUnresolved());
+        Node controlNode = filteredNodes.iterator().next();
+        InetSocketAddress address = (InetSocketAddress) controlNode.getEndPoint().resolve();
+        assertFalse(address.isUnresolved());
+        // Bytes and port only: no label, so the metric prefix and toString() read like a peer's.
+        assertThat(address.getHostString()).isEqualTo(reachedIp);
+        assertThat(controlNode.getEndPoint().asMetricPrefix())
+            .isEqualTo(reachedIp.replace('.', '_') + ":9042");
+        assertThat(nodesNamingTheContactPoint(nodes)).isEmpty();
       }
     }
   }
@@ -152,12 +159,8 @@ public class MockResolverIT {
       while (iterator.hasNext()) {
         LOG.trace("Metadata node: " + iterator.next().toString());
       }
-      Set<Node> filteredNodes;
-      filteredNodes =
-          nodes.stream()
-              .filter(x -> x.toString().contains("test.cluster.fake"))
-              .collect(Collectors.toSet());
-      assertThat(filteredNodes).hasSize(1);
+      // Every node, the control node included, is identified by its own address.
+      assertThat(nodesNamingTheContactPoint(nodes)).isEmpty();
     }
     try (CcmBridge ccmBridge =
         CcmBridge.builder().withNodes(numberOfNodes).withIpPrefix("127.0.1.").build()) {
@@ -175,21 +178,33 @@ public class MockResolverIT {
       while (iterator.hasNext()) {
         LOG.trace("Metadata node: " + iterator.next().toString());
       }
-      Set<Node> filteredNodes;
-      filteredNodes =
-          nodes.stream()
-              .filter(x -> x.toString().contains("test.cluster.fake"))
-              .collect(Collectors.toSet());
-      if (filteredNodes.size() == 0) {
-        LOG.error(
-            "No metadata node with \"test.cluster.fake\" substring. The unresolved endpoint socket was likely "
-                + "replaced with resolved one.");
-      } else if (filteredNodes.size() > 1) {
-        fail(
-            "Somehow there is more than 1 node in metadata with unresolved hostname. This should not ever happen.");
-      }
+      assertThat(nodesNamingTheContactPoint(nodes)).isEmpty();
     }
     session.close();
+  }
+
+  /** The IP literal a node's endpoint resolves to, or {@code null} if it is not resolved. */
+  private static String hostAddressOf(Node node) {
+    SocketAddress resolved = node.getEndPoint().resolve();
+    if (resolved instanceof InetSocketAddress && !((InetSocketAddress) resolved).isUnresolved()) {
+      return ((InetSocketAddress) resolved).getAddress().getHostAddress();
+    }
+    return null;
+  }
+
+  /**
+   * The nodes whose endpoint carries the contact-point name as its host string. Expected empty: the
+   * node the control connection reached is identified by its own address, like every peer.
+   */
+  private static Set<Node> nodesNamingTheContactPoint(Collection<Node> nodes) {
+    return nodes.stream()
+        .filter(
+            node -> {
+              SocketAddress resolved = node.getEndPoint().resolve();
+              return resolved instanceof InetSocketAddress
+                  && "test.cluster.fake".equals(((InetSocketAddress) resolved).getHostString());
+            })
+        .collect(Collectors.toSet());
   }
 
   @SuppressWarnings("unused")

@@ -306,6 +306,11 @@ public class DriverChannel {
     return channel.localAddress();
   }
 
+  /** The address the underlying channel is connected to, as Netty reports it. */
+  public SocketAddress remoteAddress() {
+    return channel.remoteAddress();
+  }
+
   /** @return The {@link ChannelConfig configuration} of this channel. */
   public ChannelConfig config() {
     return channel.config();

@@ -545,7 +545,14 @@ public class ControlConnection implements EventCallback, AsyncAutoCloseable {
           .thenComposeAsync(
               nodeInfo -> {
                 EndPoint resolvedEp = nodeInfo.getEndPoint();
-                if (resolvedEp != null && !resolvedEp.equals(channel.getEndPoint())) {
+                // Compared by reference, not equals(): DefaultEndPoint.equals resolves the
+                // unresolved side of a mixed comparison, a blocking lookup on this admin executor,
+                // and it would answer "equal" for the very case this exists for (a hostname contact
+                // point identified by the address it reached), skipping the adoption. Adopting the
+                // monitor's instance also makes the channel and the metadata node share it, so
+                // every
+                // later comparison of the two short-circuits on identity.
+                if (resolvedEp != null && resolvedEp != channel.getEndPoint()) {
                   channel.setEndPoint(resolvedEp);
                   LOG.debug("[{}] Control channel endpoint upgraded to {}", logPrefix, resolvedEp);
                 }

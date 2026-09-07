@@ -21,12 +21,14 @@ import static com.datastax.oss.driver.Assertions.assertThat;
 import static com.datastax.oss.driver.Assertions.assertThatStage;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.datastax.oss.driver.api.core.loadbalancing.NodeDistance;
+import com.datastax.oss.driver.api.core.metadata.EndPoint;
 import com.datastax.oss.driver.api.core.metadata.Node;
 import com.datastax.oss.driver.api.core.metadata.NodeState;
 import com.datastax.oss.driver.internal.core.channel.ChannelEvent;
@@ -40,6 +42,8 @@ import com.datastax.oss.driver.internal.core.metadata.NodeStateEvent;
 import com.datastax.oss.driver.internal.core.metadata.TestNodeFactory;
 import com.datastax.oss.driver.internal.core.metadata.TopologyMonitor;
 import com.tngtech.java.junit.dataprovider.DataProviderRunner;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -774,6 +778,77 @@ public class ControlConnectionTest extends ControlConnectionTestBase {
     assertThat(nodeInfoCaptor.getValue().getHostId()).isEqualTo(resolvedHostId);
     assertThat(nodeInfoCaptor.getValue().getEndPoint()).isEqualTo(channel2.getEndPoint());
     // The channelOpened event fires for the resolved node, not the contact point
+    verify(eventBus, VERIFY_TIMEOUT).fire(ChannelEvent.channelOpened(resolvedNode));
+
+    factoryHelper.verifyNoMoreCalls();
+  }
+
+  @Test
+  public void should_adopt_identified_endpoint_without_consulting_equals() {
+    // Given -- init normally with node1, then reconnect through a contact point
+    when(reconnectionSchedule.nextDelay()).thenReturn(Duration.ofNanos(1));
+    DriverChannel channel1 = newMockDriverChannel(1);
+    DriverChannel channel2 = newMockDriverChannel(2);
+    DefaultNode contactPoint = TestNodeFactory.newContactPoint(2, context);
+    UUID resolvedHostId = UUID.randomUUID();
+    DefaultNode resolvedNode = TestNodeFactory.newNode(2, resolvedHostId, context);
+    MockChannelFactoryHelper factoryHelper =
+        MockChannelFactoryHelper.builder(channelFactory)
+            .success(node1, channel1)
+            .success(contactPoint, channel2)
+            .build();
+    CompletionStage<Void> initFuture = controlConnection.init(false, false, false);
+    factoryHelper.waitForCall(node1);
+    assertThatStage(initFuture)
+        .isSuccess(v -> assertThat(controlConnection.channel()).isEqualTo(channel1));
+
+    // The monitor identifies the node under an endpoint distinct from the channel's. Its equals()
+    // fails the test: DefaultEndPoint.equals resolves the unresolved side of a mixed comparison, a
+    // blocking lookup on the admin executor, and would answer "equal" here and skip the adoption.
+    EndPoint identified =
+        new EndPoint() {
+          @Override
+          public SocketAddress resolve() {
+            return new InetSocketAddress("127.0.0.2", 9042);
+          }
+
+          @Override
+          public String asMetricPrefix() {
+            return "127_0_0_2:9042";
+          }
+
+          @Override
+          public boolean equals(Object other) {
+            throw new AssertionError("equals() must not be consulted: it may resolve a hostname");
+          }
+
+          @Override
+          public int hashCode() {
+            return 0;
+          }
+        };
+    TopologyMonitor topologyMonitor = context.getTopologyMonitor();
+    when(topologyMonitor.getChannelNodeInfo(channel2))
+        .thenReturn(
+            CompletableFuture.completedFuture(
+                DefaultNodeInfo.builder()
+                    .withEndPoint(identified)
+                    .withHostId(resolvedHostId)
+                    .build()));
+    when(metadataManager.registerNode(any()))
+        .thenAnswer(
+            invocation -> {
+              registeredNodes.put(resolvedNode.getHostId(), resolvedNode);
+              return CompletableFuture.completedFuture(resolvedNode);
+            });
+
+    // When -- channel goes down, the reconnection plan offers the contact point
+    mockQueryPlan(contactPoint);
+    channel1.close();
+
+    // Then -- the channel adopts the monitor's instance, by reference
+    factoryHelper.waitForCall(contactPoint);
+    verify(channel2, VERIFY_TIMEOUT).setEndPoint(same(identified));
     verify(eventBus, VERIFY_TIMEOUT).fire(ChannelEvent.channelOpened(resolvedNode));
 
     factoryHelper.verifyNoMoreCalls();
