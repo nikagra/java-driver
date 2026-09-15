@@ -1,5 +1,6 @@
 package com.datastax.oss.driver.internal.core.metadata;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 
 import com.datastax.oss.driver.api.core.CqlIdentifier;
@@ -16,6 +17,11 @@ import org.junit.Test;
 import org.testng.Assert;
 
 public class DefaultTabletMapTest {
+
+  private static final CqlIdentifier KS = CqlIdentifier.fromCql("ks");
+  private static final CqlIdentifier KS2 = CqlIdentifier.fromCql("ks2");
+  private static final CqlIdentifier TABLE = CqlIdentifier.fromCql("tab");
+  private static final CqlIdentifier TABLE2 = CqlIdentifier.fromCql("tab2");
 
   @Test
   public void should_remove_overlapping_tablets() {
@@ -110,5 +116,123 @@ public class DefaultTabletMapTest {
         tabletMap.getTablet(CqlIdentifier.fromCql("ks"), CqlIdentifier.fromCql("tab"), 456);
     Assert.assertEquals(result.getShardForNode(node1), 1);
     Assert.assertEquals(result.getShardForNode(node2), 2);
+  }
+
+  // --- Removal --------------------------------------------------------------------------------
+
+  @Test
+  public void should_remove_tablets_by_node() {
+    Node node1 = mock(DefaultNode.class);
+    Node node2 = mock(DefaultNode.class);
+    TabletMap tabletMap = DefaultTabletMap.emptyMap();
+    tabletMap.addTablet(KS, TABLE, tablet(0, 10, node1));
+    tabletMap.addTablet(KS, TABLE, tablet(10, 20, node2));
+    tabletMap.addTablet(KS, TABLE2, tablet(0, 10, node1));
+
+    tabletMap.removeByNode(node1);
+
+    assertThat(tabletMap.getMapping().get(key(KS, TABLE))).hasSize(1);
+    assertThat(tabletMap.getMapping().get(key(KS, TABLE))).allMatch(t -> !contains(t, node1));
+    assertThat(tabletMap.getMapping().get(key(KS, TABLE2))).isEmpty();
+  }
+
+  @Test
+  public void should_remove_tablets_by_keyspace() {
+    TabletMap tabletMap = DefaultTabletMap.emptyMap();
+    tabletMap.addTablet(KS, TABLE, tablet(0, 10));
+    tabletMap.addTablet(KS, TABLE2, tablet(0, 10));
+    tabletMap.addTablet(KS2, TABLE, tablet(0, 10));
+
+    tabletMap.removeByKeyspace(KS);
+
+    assertThat(tabletMap.getMapping()).containsOnlyKeys(key(KS2, TABLE));
+  }
+
+  /**
+   * removeByTable matches on the table name alone, so a table dropped in one keyspace also evicts
+   * same-named tables in every other keyspace. Pinned here because it is load-bearing: the cost is
+   * an unnecessary refetch, not incorrect routing.
+   */
+  @Test
+  public void should_remove_tablets_by_table_name_across_keyspaces() {
+    TabletMap tabletMap = DefaultTabletMap.emptyMap();
+    tabletMap.addTablet(KS, TABLE, tablet(0, 10));
+    tabletMap.addTablet(KS2, TABLE, tablet(0, 10));
+    tabletMap.addTablet(KS, TABLE2, tablet(0, 10));
+
+    tabletMap.removeByTable(TABLE);
+
+    assertThat(tabletMap.getMapping()).containsOnlyKeys(key(KS, TABLE2));
+  }
+
+  // --- Overlap eviction, second sweep ----------------------------------------------------------
+
+  @Test
+  public void should_evict_tablet_that_starts_before_and_ends_after_the_new_one() {
+    // The existing tablet survives the first sweep (its lastToken is beyond the new one) but
+    // overlaps on its leading edge, so the second sweep must drop it.
+    TabletMap tabletMap = DefaultTabletMap.emptyMap();
+    Tablet wide = tablet(0, 100);
+    tabletMap.addTablet(KS, TABLE, wide);
+
+    Tablet overlapping = tablet(-50, 10);
+    tabletMap.addTablet(KS, TABLE, overlapping);
+
+    assertThat(tabletMap.getMapping().get(key(KS, TABLE))).containsExactly(overlapping);
+  }
+
+  @Test
+  public void should_keep_tablet_that_starts_at_or_after_the_new_one() {
+    // Mirror image: the second sweep breaks out instead of removing.
+    TabletMap tabletMap = DefaultTabletMap.emptyMap();
+    Tablet later = tablet(20, 100);
+    tabletMap.addTablet(KS, TABLE, later);
+
+    Tablet earlier = tablet(-50, 10);
+    tabletMap.addTablet(KS, TABLE, earlier);
+
+    assertThat(tabletMap.getMapping().get(key(KS, TABLE))).containsExactly(earlier, later);
+  }
+
+  // --- DefaultTablet value semantics -----------------------------------------------------------
+
+  @Test
+  public void should_compare_tablets_by_value() {
+    Tablet tablet = tablet(0, 10);
+
+    assertThat(tablet).isEqualTo(tablet);
+    assertThat(tablet).isEqualTo(tablet(0, 10));
+    assertThat(tablet).isNotEqualTo(tablet(0, 11));
+    assertThat(tablet).isNotEqualTo(tablet(1, 10));
+    assertThat(tablet).isNotEqualTo("not a tablet");
+    assertThat(tablet).isNotEqualTo(null);
+    assertThat(tablet.hashCode()).isEqualTo(tablet(0, 10).hashCode());
+  }
+
+  @Test
+  public void should_print_token_range_in_to_string() {
+    assertThat(tablet(0, 10).toString())
+        .contains("firstToken=0")
+        .contains("lastToken=10")
+        .contains("replicaNodes=")
+        .contains("replicaShards=");
+  }
+
+  private static boolean contains(Tablet tablet, Node node) {
+    return tablet.getReplicaNodesList().contains(node);
+  }
+
+  private static KeyspaceTableNamePair key(CqlIdentifier keyspace, CqlIdentifier table) {
+    return new KeyspaceTableNamePair(keyspace, table);
+  }
+
+  private static Tablet tablet(long firstToken, long lastToken, Node... replicas) {
+    Map<Node, Integer> replicaShards = new HashMap<>();
+    int shard = 0;
+    for (Node replica : replicas) {
+      replicaShards.put(replica, shard++);
+    }
+    return new DefaultTabletMap.DefaultTablet(
+        firstToken, lastToken, ImmutableList.copyOf(replicas), replicaShards);
   }
 }
