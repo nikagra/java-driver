@@ -6,7 +6,7 @@ name: Upstream sync ancestry
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, closed]
-    branches: [scylla-4.x, scylla-3.x]
+    branches: [scylla-4.x, scylla-3.x, ancestry-test-base]
 
 permissions: {}
 
