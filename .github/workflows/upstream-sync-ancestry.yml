@@ -1,0 +1,98 @@
+name: Upstream sync ancestry
+
+# A pull request that merges an upstream tag must land as a merge commit; squash or rebase drops
+# apache's ancestry. GitHub can't enforce a merge method per pull request, so this reminds before
+# the merge and raises an alarm after a bad one. The same file lives on both lines.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, closed]
+    branches: [scylla-4.x, scylla-3.x]
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync-ancestry-${{ github.event.pull_request.number }}
+
+jobs:
+  check:
+    name: Check upstream sync ancestry
+    if: github.event.action != 'closed' || github.event.pull_request.merged
+    runs-on: ubuntu-latest
+
+    permissions:
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Compare the apache tags in the pull request with the base branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+        run: |
+          set -euo pipefail
+          # Commits only, no checkout: pull request code is never on disk, let alone run.
+          git init -q graph
+          cd graph
+          git fetch -q --filter=tree:0 --no-tags "https://github.com/$GITHUB_REPOSITORY" \
+            "+refs/pull/$PR/head:refs/pr/head" "+refs/heads/$BASE:refs/base/tip"
+          git fetch -q --filter=tree:0 --no-tags https://github.com/apache/cassandra-java-driver \
+            '+refs/tags/*:refs/apache-tags/*'
+
+          # Before the merge, a non-empty list makes this a sync pull request. After the merge,
+          # it means the base lost the ancestry.
+          tags="$(
+            git for-each-ref --sort=-version:refname --format='%(refname:lstrip=2)' \
+              --merged refs/pr/head --no-merged refs/base/tip refs/apache-tags/
+          )"
+          if [[ -z "$tags" ]]; then
+            echo "No upstream tag missing from $BASE."
+            exit 0
+          fi
+          newest="$(head -n 1 <<<"$tags")"
+          echo "Upstream tags in the pull request but not in $BASE: $(paste -sd' ' <<<"$tags")"
+          guide="https://github.com/$GITHUB_REPOSITORY/blob/scylla-4.x/CONTRIBUTING.md#merging-upstream-releases"
+
+          if [[ "$MERGED" != true ]]; then
+            marker='<!-- upstream-sync-ancestry -->'
+            bodies="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --jq '.[].body')"
+            if grep -qF "$marker" <<<"$bodies"; then
+              echo "Already reminded."
+              exit 0
+            fi
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file - <<EOF
+          $marker
+          This pull request merges upstream \`$newest\`. Merge it with **Create a merge commit**, using the ruleset bypass. Squash or rebase drops \`$newest\` from \`$BASE\`'s history.
+          See [Merging upstream releases]($guide).
+          EOF
+            exit 0
+          fi
+
+          body="$(cat <<EOF
+          #$PR was merged into \`$BASE\` without \`$newest\` becoming an ancestor, so it was squashed or rebased. The content is there; the ancestry is not.
+
+          Repair it with a pull request that holds only an ancestry merge, merged with **Create a merge commit** (as #1281 did):
+
+          \`\`\`
+          git fetch https://github.com/apache/cassandra-java-driver tag $newest
+          git switch -c restore-$newest <scylladb-remote>/$BASE
+          git merge -s ours $newest -m "chore: record upstream $newest ancestry"
+          \`\`\`
+
+          See [Merging upstream releases]($guide).
+          EOF
+          )"
+          # The pull request comment carries the repair too, in case the issue can't be opened.
+          issue="$(
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "$BASE: restore upstream $newest ancestry lost in #$PR" --body "$body"
+          )" || issue="no issue opened"
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file - <<EOF
+          @$MERGED_BY this merge dropped \`$newest\` from \`$BASE\`'s history ($issue).
+
+          $body
+          EOF
+          echo "::error::#$PR dropped $newest from $BASE's history ($issue)"
+          exit 1
